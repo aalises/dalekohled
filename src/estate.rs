@@ -1167,7 +1167,9 @@ impl FixOp {
             }
             FixOp::Trash { path } => format!("move {path} to the cxwatch trash"),
             FixOp::Command { argv } => format!("run `{}`", argv.join(" ")),
-            FixOp::DeleteTomlTable { file, table } => format!("delete the [{table}] block from {file}"),
+            FixOp::DeleteTomlTable { file, table } => {
+                format!("delete the [{table}] block from {file}")
+            }
             FixOp::Manual => "manual edit needed".into(),
         }
     }
@@ -1189,13 +1191,20 @@ pub(crate) fn fix_op(f: &EstateFinding) -> FixOp {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| f.path.clone()),
         },
-        "dead-command" => FixOp::Trash { path: f.path.clone() },
+        "dead-command" => FixOp::Trash {
+            path: f.path.clone(),
+        },
         "dead-mcp" => {
             let name = f.unit.rsplit(':').next().unwrap_or("").to_string();
             if f.unit.contains("claude:") {
-                FixOp::Command { argv: vec!["claude".into(), "mcp".into(), "remove".into(), name] }
+                FixOp::Command {
+                    argv: vec!["claude".into(), "mcp".into(), "remove".into(), name],
+                }
             } else {
-                FixOp::DeleteTomlTable { file: f.path.clone(), table: format!("mcp_servers.{name}") }
+                FixOp::DeleteTomlTable {
+                    file: f.path.clone(),
+                    table: format!("mcp_servers.{name}"),
+                }
             }
         }
         "orphan-memory" => match backticked(&f.fix) {
@@ -1209,7 +1218,10 @@ pub(crate) fn fix_op(f: &EstateFinding) -> FixOp {
             None => FixOp::Manual,
         },
         "dangling-index" => match backticked(&f.fix) {
-            Some(contains) => FixOp::DeleteMatchingLine { file: f.path.clone(), contains },
+            Some(contains) => FixOp::DeleteMatchingLine {
+                file: f.path.clone(),
+                contains,
+            },
             None => FixOp::Manual,
         },
         _ => FixOp::Manual,
@@ -1223,7 +1235,10 @@ fn trash_dest(path: &str) -> Result<PathBuf> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let name = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("item");
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("item");
     Ok(dir.join(format!("{epoch}-{name}")))
 }
 
@@ -1255,7 +1270,10 @@ pub(crate) fn apply_fix(op: &FixOp) -> Result<String> {
         FixOp::DeleteMatchingLine { file, contains } => {
             backup(file)?;
             let s = std::fs::read_to_string(file)?;
-            let kept: Vec<&str> = s.lines().filter(|l| !l.contains(contains.as_str())).collect();
+            let kept: Vec<&str> = s
+                .lines()
+                .filter(|l| !l.contains(contains.as_str()))
+                .collect();
             let removed = s.lines().count() - kept.len();
             if removed == 0 {
                 anyhow::bail!("no line containing `{contains}` in {file}");
@@ -1269,11 +1287,17 @@ pub(crate) fn apply_fix(op: &FixOp) -> Result<String> {
             Ok(format!("moved to {}", dest.display()))
         }
         FixOp::Command { argv } => {
-            let out = std::process::Command::new(&argv[0]).args(&argv[1..]).output()?;
+            let out = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()?;
             if out.status.success() {
                 Ok(format!("ran `{}`", argv.join(" ")))
             } else {
-                anyhow::bail!("`{}` failed: {}", argv.join(" "), String::from_utf8_lossy(&out.stderr).trim())
+                anyhow::bail!(
+                    "`{}` failed: {}",
+                    argv.join(" "),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )
             }
         }
         FixOp::DeleteTomlTable { file, table } => {
@@ -1305,8 +1329,11 @@ pub(crate) fn apply_fix(op: &FixOp) -> Result<String> {
 
 fn fix_flow(r: &EstateReport, yes: bool) -> Result<()> {
     use std::io::{BufRead, Write};
-    let mechanical: Vec<&EstateFinding> =
-        r.findings.iter().filter(|f| fix_op(f) != FixOp::Manual).collect();
+    let mechanical: Vec<&EstateFinding> = r
+        .findings
+        .iter()
+        .filter(|f| fix_op(f) != FixOp::Manual)
+        .collect();
     if mechanical.is_empty() {
         println!("no mechanical fixes available — export the plan for the rest (-o plan.md)");
         return Ok(());
@@ -1510,21 +1537,49 @@ mod tests {
         let f = finding("dead-mcp", "mcp claude:figma", "/h/.claude.json", "");
         assert_eq!(
             fix_op(&f),
-            FixOp::Command { argv: vec!["claude".into(), "mcp".into(), "remove".into(), "figma".into()] }
+            FixOp::Command {
+                argv: vec![
+                    "claude".into(),
+                    "mcp".into(),
+                    "remove".into(),
+                    "figma".into()
+                ]
+            }
         );
         let f = finding("dead-mcp", "mcp codex:figma", "/h/.codex/config.toml", "");
         assert_eq!(
             fix_op(&f),
-            FixOp::DeleteTomlTable { file: "/h/.codex/config.toml".into(), table: "mcp_servers.figma".into() }
+            FixOp::DeleteTomlTable {
+                file: "/h/.codex/config.toml".into(),
+                table: "mcp_servers.figma".into()
+            }
         );
-        let f = finding("dead-skill", "skill graphify", "/h/.claude/skills/graphify/SKILL.md", "");
-        assert_eq!(fix_op(&f), FixOp::Trash { path: "/h/.claude/skills/graphify".into() });
-        let f = finding("dead-skill", "skill codex:linear", "/x/SKILL.md", "");
-        assert_eq!(fix_op(&f), FixOp::Manual);
-        let f = finding("orphan-memory", "memory p/a.md", "/m/memory/a.md", "append to /m/memory/MEMORY.md: `- [a](a.md) — d`");
+        let f = finding(
+            "dead-skill",
+            "skill graphify",
+            "/h/.claude/skills/graphify/SKILL.md",
+            "",
+        );
         assert_eq!(
             fix_op(&f),
-            FixOp::AppendLine { file: "/m/memory/MEMORY.md".into(), line: "- [a](a.md) — d".into() }
+            FixOp::Trash {
+                path: "/h/.claude/skills/graphify".into()
+            }
+        );
+        let f = finding("dead-skill", "skill codex:linear", "/x/SKILL.md", "");
+        assert_eq!(fix_op(&f), FixOp::Manual);
+        let f = finding(
+            "orphan-memory",
+            "memory p/a.md",
+            "/m/memory/a.md",
+            "append to /m/memory/MEMORY.md: `- [a](a.md) — d`",
+        );
+        assert_eq!(
+            fix_op(&f),
+            FixOp::AppendLine {
+                file: "/m/memory/MEMORY.md".into(),
+                line: "- [a](a.md) — d".into()
+            }
         );
         let f = finding("stale-ref", "memory p/b.md", "/m/b.md", "edit it");
         assert_eq!(fix_op(&f), FixOp::Manual);
@@ -1537,17 +1592,33 @@ mod tests {
         let idx = dir.join("MEMORY.md");
         std::fs::write(&idx, "# Notes\n- [a](a.md) — x\n").unwrap();
         let file = idx.display().to_string();
-        apply_fix(&FixOp::AppendLine { file: file.clone(), line: "- [b](b.md) — y".into() }).unwrap();
+        apply_fix(&FixOp::AppendLine {
+            file: file.clone(),
+            line: "- [b](b.md) — y".into(),
+        })
+        .unwrap();
         assert!(std::fs::read_to_string(&idx).unwrap().contains("(b.md)"));
         // idempotent
-        let msg = apply_fix(&FixOp::AppendLine { file: file.clone(), line: "- [b](b.md) — y".into() }).unwrap();
+        let msg = apply_fix(&FixOp::AppendLine {
+            file: file.clone(),
+            line: "- [b](b.md) — y".into(),
+        })
+        .unwrap();
         assert!(msg.contains("already present"));
-        apply_fix(&FixOp::DeleteMatchingLine { file: file.clone(), contains: "(a.md)".into() }).unwrap();
+        apply_fix(&FixOp::DeleteMatchingLine {
+            file: file.clone(),
+            contains: "(a.md)".into(),
+        })
+        .unwrap();
         assert!(!std::fs::read_to_string(&idx).unwrap().contains("(a.md)"));
 
         let toml = dir.join("config.toml");
         std::fs::write(&toml, "[a]\nx = 1\n[mcp_servers.figma]\nurl = \"y\"\n[mcp_servers.figma.env]\nk = \"v\"\n[b]\nz = 2\n").unwrap();
-        apply_fix(&FixOp::DeleteTomlTable { file: toml.display().to_string(), table: "mcp_servers.figma".into() }).unwrap();
+        apply_fix(&FixOp::DeleteTomlTable {
+            file: toml.display().to_string(),
+            table: "mcp_servers.figma".into(),
+        })
+        .unwrap();
         let s = std::fs::read_to_string(&toml).unwrap();
         assert!(!s.contains("figma") && s.contains("[a]") && s.contains("[b]"));
         std::fs::remove_dir_all(&dir).unwrap();

@@ -23,7 +23,7 @@ pub(crate) fn semantic_model() -> String {
 #[derive(Parser)]
 #[command(
     name = "cxwatch",
-    about = "Context hygiene for agent sessions (pi, Claude Code, Codex)"
+    about = "Context hygiene for Claude Code, Codex, pi, and OpenCode sessions"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -1320,10 +1320,10 @@ fn status_line(path: &Path, label: &str) -> String {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    if cache[&key]["size"].as_u64() == Some(size) {
-        if let Some(line) = cache[&key]["line"].as_str() {
-            return line.to_string();
-        }
+    if cache[&key]["size"].as_u64() == Some(size)
+        && let Some(line) = cache[&key]["line"].as_str()
+    {
+        return line.to_string();
     }
     let line = match parse(path) {
         Err(e) => format!("[{label}] cxwatch: {e}"),
@@ -1362,7 +1362,11 @@ pub(crate) fn cache_dir() -> PathBuf {
 
 fn meter(pct: usize) -> String {
     let filled = (pct.min(100) + 5) / 10;
-    format!("{}{}", "█".repeat(filled), "░".repeat(10usize.saturating_sub(filled)))
+    format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(10usize.saturating_sub(filled))
+    )
 }
 
 #[cfg(test)]
@@ -1376,7 +1380,10 @@ mod tests {
         assert_eq!(meter(66), "███████░░░");
         assert_eq!(meter(100), "██████████");
         let j = r#"{"session_id":"s","transcript_path":"/tmp/x.jsonl","model":{"id":"m"}}"#;
-        assert_eq!(transcript_from_statusline_json(j), Some(PathBuf::from("/tmp/x.jsonl")));
+        assert_eq!(
+            transcript_from_statusline_json(j),
+            Some(PathBuf::from("/tmp/x.jsonl"))
+        );
         assert_eq!(transcript_from_statusline_json("not json"), None);
     }
 

@@ -1,45 +1,57 @@
 # cxwatch 🔭
 
-**Find stale session context and unused agent configuration before they waste tokens.**
+**See the context your coding agent no longer needs.**
 
-`cxwatch` is the command-line tool in the `dalekohled` project. It audits the context of AI coding agents such as Claude Code, Codex, pi, and OpenCode.
+cxwatch audits coding-agent sessions and persistent agent setup. It ranks stale context by token cost, shows the evidence for each finding, and gives you a clear cleanup path.
+
+**Supported harnesses: Claude Code, Codex, pi, and OpenCode.**
 
 ![cxwatch terminal demo](demo.gif)
 
-Coding agents collect context while they work. An old file read can remain after an edit. A large tool result can stay in the session after it is no longer useful. Skills, MCP servers, commands, hooks, and memory files can also remain configured after you stop using them.
+Long sessions collect old file reads, replaced tool output, and large reasoning blocks. Agent setup also grows over time. Skills, commands, MCP servers, hooks, and memory files can stay active after their value is gone.
 
-`cxwatch` finds this waste and shows:
+cxwatch answers four practical questions:
 
-- what is stale, large, duplicated, or unused;
-- how many tokens each finding costs;
-- the evidence for each finding;
-- the file or command that can fix it.
+- How much of this session can I reclaim?
+- Which exact items cause the waste?
+- Which parts of my agent setup show no observed use?
+- Which fixes can I apply now, and which ones need review?
 
-The default checks are deterministic and local. `cxwatch` only reports findings. It does not change your files or configuration.
+## One tool, three views
 
-## Quick start
+| View | What it does | Start it |
+|---|---|---|
+| Session audit | Finds stale reads and large context items in one run | `cxwatch` |
+| Estate audit | Compares static agent setup with observed transcript use | `cxwatch estate` |
+| Rot-o-meter | Shows a compact score for status lines and terminal bars | `cxwatch status` |
+
+The default audits use local files. They do not change your agent configuration. cxwatch writes only its cache and the reports that you request. The `--fix` option is the only audit mode that changes agent setup.
+
+## Supported harnesses
+
+| Harness | Session data | Estate data |
+|---|---|---|
+| Claude Code | `~/.claude/projects` | Skills, commands, MCP servers, hooks, memory, and `CLAUDE.md` |
+| Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` | Plugin skills, MCP servers, and `AGENTS.md` |
+| pi | `~/.pi/agent/sessions` | Package skills |
+| OpenCode | `~/.local/share/opencode/opencode.db` | `~/.config/opencode/AGENTS.md` |
+
+cxwatch reads OpenCode session data through the local `sqlite3` command in read-only mode.
+
+## Install and start
+
+You need Rust 1.88 or later.
 
 ```bash
+cargo install --git https://github.com/aalises/dalekohled
 cxwatch
 ```
 
-The interactive view lists recent sessions from all supported agents. Select a session to see the largest context problems first. Press `Ctrl+E` to open the static context audit.
+The first command installs cxwatch. The second command opens the session picker.
 
-You can also run direct commands:
+If you use OpenCode, the `sqlite3` command must be available in your `PATH`.
 
-```bash
-cxwatch report                    # Audit the most recent session
-cxwatch report path/to/run.jsonl  # Audit one session file
-cxwatch estate                    # Audit static agent configuration
-cxwatch estate -o cleanup.md      # Write a cleanup report
-cxwatch estate --json             # Return machine-readable output
-cxwatch estate --fix              # Apply mechanical fixes interactively
-cxwatch status                    # One-line rot-o-meter for the latest session
-```
-
-## Install
-
-You need Rust 1.88 or later.
+To install from a local clone:
 
 ```bash
 git clone https://github.com/aalises/dalekohled.git
@@ -47,100 +59,160 @@ cd dalekohled
 cargo install --path .
 ```
 
-You can also install from GitHub:
+## Your first audit
+
+Run cxwatch with no arguments:
 
 ```bash
-cargo install --git https://github.com/aalises/dalekohled
+cxwatch
 ```
 
-OpenCode support needs the `sqlite3` command. macOS includes this command by default.
+Then:
 
-## What cxwatch audits
+1. Type part of a project name or prompt to filter the session list.
+2. Select a session and press `Enter`.
+3. Review the largest findings first.
+4. Press `Ctrl+E` to audit persistent agent setup.
+5. Press `e` in a report to export a Markdown cleanup plan.
 
-### Session context
-
-The session audit checks the transcript of one agent run.
-
-| Check | What it finds |
-|---|---|
-| `stale-read` | A file read that appears before a later edit of the same file |
-| `superseded-read` | A file read that appears before a later read of the same file |
-| `huge-thinking` | A reasoning block with more than 2,000 tokens |
-| `huge-output` | A tool result with more than 2,500 tokens |
-
-For stale and superseded reads, `cxwatch` assigns the token cost of the related tool result. This shows the context that the session can reclaim.
-
-### Static context
-
-The estate audit compares configured context with observed use in local transcripts.
-
-| Check | What it finds |
-|---|---|
-| `dead-mcp` | An MCP server with no observed calls in its agent |
-| `dead-skill` | A skill with no observed use after a 14-day grace period |
-| `dead-command` | A Claude Code command with no observed use |
-| `duplicate-directive` | Repeated skill guidance in `CLAUDE.md` |
-| `hook-tax` | Large payloads from Claude Code hooks |
-| `orphan-memory` | A memory file that is absent from `MEMORY.md` |
-| `dangling-index` | A `MEMORY.md` entry for a missing file |
-| `stale-ref` | An instruction or memory file that refers to a missing path |
-| `stale-memory` | A memory file that has not changed for 120 days |
-| `heavy-block` | An instruction section with more than 400 tokens |
-
-The cleanup report groups findings by action. Each item includes a path, evidence, and a proposed fix. Review all deletion and configuration changes before you apply them.
-
-## Apply fixes
-
-Some findings have a mechanical fix: repair a memory index, delete an unused command or skill, remove an unused MCP server. `cxwatch` can apply these for you:
+For a quick non-interactive check:
 
 ```bash
-cxwatch estate --fix        # Confirm each fix: y, n, a (all), or q (quit)
-cxwatch estate --fix --yes  # Apply all mechanical fixes without prompts
+cxwatch report
+cxwatch estate
+cxwatch status
 ```
 
-In the interactive estate view, press `F` once to see the fix and press `F` again to apply it.
+## Command guide
 
-Before any change, `cxwatch` copies the affected file to `~/.cache/cxwatch/trash`. Deleted files and directories move there instead of being removed. Findings without a mechanical fix stay report-only; use the cleanup report for those.
+| Command | Result |
+|---|---|
+| `cxwatch` | Opens the interactive session picker |
+| `cxwatch report [SESSION]` | Audits one session, or the most recent session |
+| `cxwatch explain [SESSION] -o report.md` | Writes a Markdown session report and runs the semantic pass |
+| `cxwatch sessions` | Lists all discovered sessions |
+| `cxwatch pick [--semantic]` | Opens the picker and can enable semantic analysis at startup |
+| `cxwatch estate` | Audits skills, commands, MCP servers, hooks, memory, and instruction files |
+| `cxwatch estate -o cleanup.md` | Writes a reviewable Markdown cleanup plan |
+| `cxwatch estate --fix` | Offers each supported mechanical fix for confirmation |
+| `cxwatch status [SESSION]` | Prints a one-line score for a selected or recent session |
+| `cxwatch statusline` | Reads Claude Code status-line data from standard input and scores the current session |
 
-## Rot-o-meter
+A `SESSION` can be a transcript path. OpenCode sessions use the internal `opencode:<id>` form that `cxwatch sessions` prints.
 
-`cxwatch status` prints a one-line summary of the most recent session across all agents:
+## Session audit
 
+A session audit reads one transcript and sorts findings by estimated token cost.
+
+| Check | What it means |
+|---|---|
+| `stale-read` | A file read happened before a later edit of the same file |
+| `superseded-read` | A file read happened before a later read of the same file |
+| `huge-thinking` | A reasoning block contains more than 2,000 tokens |
+| `huge-output` | A tool result contains more than 2,500 tokens |
+
+For stale and superseded reads, cxwatch assigns the cost of the related tool result. The summary shows estimated session tokens, reclaimable tokens, and a reclaimable percentage.
+
+```text
+events 644 · session ≈218.4k tok · 47 findings · ≈135.8k tok reclaimable (62%)
 ```
+
+The session audit reports waste. It does not remove history from a running agent session.
+
+## Estate audit
+
+An estate audit checks persistent context against observed use in local transcripts.
+
+| Check | What it means |
+|---|---|
+| `dead-mcp` | An MCP server has no observed calls in its configured agent |
+| `dead-skill` | A skill has no observed use after a 14-day grace period |
+| `dead-command` | A Claude Code command has no observed use |
+| `duplicate-directive` | `CLAUDE.md` repeats guidance for a skill |
+| `hook-tax` | A Claude Code hook injects a large payload |
+| `orphan-memory` | A memory file is missing from `MEMORY.md` |
+| `dangling-index` | `MEMORY.md` points to a file that does not exist |
+| `stale-ref` | An instruction or memory file points to a missing path |
+| `stale-memory` | A memory file has not changed for 120 days |
+| `heavy-block` | An always-loaded instruction section contains more than 400 tokens |
+
+Each finding includes:
+
+- the rule and affected unit;
+- the estimated token cost;
+- the observed-use count;
+- the relevant file path;
+- a proposed action and concrete fix.
+
+“No observed use” is evidence from the transcripts that cxwatch can read. It is not proof that you will never need the item. Review the cleanup plan before you remove configuration.
+
+## Apply safe fixes
+
+cxwatch can apply a limited set of mechanical estate fixes:
+
+- add a missing memory index entry;
+- remove a broken memory index entry;
+- move an unused Claude Code skill or command to the cxwatch trash;
+- remove an unused Claude Code MCP server with `claude mcp remove`;
+- remove an unused Codex MCP table from `config.toml`.
+
+Run the interactive fix flow:
+
+```bash
+cxwatch estate --fix
+```
+
+For each fix, choose `y`, `n`, `a` to apply all remaining fixes, or `q` to stop. To apply all supported fixes without prompts:
+
+```bash
+cxwatch estate --fix --yes
+```
+
+In the interactive estate view, select a finding and press `f` twice. The first press shows the exact operation. The second press applies it.
+
+Before cxwatch edits a file, it saves a copy under `~/.cache/cxwatch/trash`. cxwatch moves deleted files and directories to the same location. A fix that runs an external command uses that command’s behavior. Findings that need judgment stay report-only.
+
+## Keep the score visible
+
+`cxwatch status` prints a one-line rot score:
+
+```text
 [codex] rot  62% ██████░░░░ ~135.8k tok reclaimable · 47 findings
 ```
 
-Results are cached by session size, so repeated calls return in milliseconds. Use it anywhere that shows a line of text:
+Without a session argument, it scores the most recent discovered session. cxwatch caches the line by session size, so frequent status refreshes do not repeat the full audit when the session did not change.
 
-- **Claude Code statusline** — add to `~/.claude/settings.json`:
+### Claude Code status line
 
-  ```json
-  { "statusLine": { "type": "command", "command": "cxwatch statusline" } }
-  ```
+Add this setting to `~/.claude/settings.json`:
 
-  `cxwatch statusline` reads the statusline JSON on stdin and reports the rot of the *current* session. If you already have a statusline script, append `cxwatch statusline` output to it.
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "cxwatch statusline"
+  }
+}
+```
 
-- **tmux** — works for every agent running in the terminal:
+Claude Code sends the current transcript path on standard input. `cxwatch statusline` uses that path, so the score follows the active Claude Code session.
 
-  ```
-  set -g status-right '#(cxwatch status)'
-  set -g status-interval 15
-  ```
+### tmux
 
-- **Codex** — point `notify` in `~/.codex/config.toml` at a script that runs `cxwatch status` and raises a notification above your threshold.
+Add these lines to `~/.tmux.conf`:
 
-## Supported agents
+```tmux
+set -g status-right '#(cxwatch status)'
+set -g status-interval 15
+```
 
-| Agent | Session source | Static context source |
-|---|---|---|
-| Claude Code | `~/.claude/projects` | Skills, commands, memory, hooks, MCP servers, and `CLAUDE.md` |
-| Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` | Plugin skills, MCP servers, and `AGENTS.md` |
-| pi | `~/.pi/agent/sessions` | Package skills |
-| OpenCode | `~/.local/share/opencode/opencode.db` | `~/.config/opencode/AGENTS.md` |
+This form shows the latest discovered session across all supported agents.
 
-## Semantic analysis
+## Local analysis and optional semantic analysis
 
-The optional semantic pass looks for contradictions and repeated guidance that deterministic checks cannot find.
+Deterministic audits stay on your computer. They parse transcripts, count tokens, match file operations, and compare configured units with observed calls.
+
+The optional semantic pass looks for contradictions and repeated guidance that fixed rules cannot detect:
 
 ```bash
 cxwatch report --semantic
@@ -148,67 +220,84 @@ cxwatch estate --semantic -o cleanup.md
 cxwatch pick --semantic
 ```
 
-This pass needs the `pi` command. It uses the `moonshotai/kimi-k3` model by default. Set `CXWATCH_SEMANTIC_MODEL` to use a different model.
+`cxwatch explain` also runs the semantic pass.
 
-Important: the semantic pass sends a limited digest to the model through `pi`. The digest can contain session messages, instructions, skills, and memory text. Do not use `--semantic` until you have checked the data policy and configuration of your model provider. The default audit does not send this content to a model.
+Semantic analysis needs the `pi` command. The default model is `moonshotai/kimi-k3`. Set `CXWATCH_SEMANTIC_MODEL` to select another model:
 
-## Interactive controls
+```bash
+CXWATCH_SEMANTIC_MODEL=provider/model cxwatch report --semantic
+```
 
-Session picker:
+The semantic pass sends a limited digest through `pi` to the configured model provider. The digest can contain session messages, instructions, skill text, and memory text. Check the provider’s data policy before you enable this option.
 
-- Type to filter the list.
-- Use `Up` and `Down` to move.
-- Press `Enter` to audit a session.
-- Press `Ctrl+E` to open the estate audit.
-- Press `Tab` to enable or disable semantic analysis.
-- Press `Esc` to clear the filter or exit.
+## Output for scripts and cleanup tasks
 
-Report and estate views:
-
-- Use `Up` and `Down` to scroll.
-- Press `Enter` to show the proposed fix for an estate finding.
-- Press `F` twice to apply a mechanical fix (first press shows what will change).
-- Press `E` to export a Markdown report.
-- Press `Esc` to return to the picker.
-- Press `Q` to exit.
-
-## Output for scripts
-
-Use JSON output when another tool must process the findings:
+Use JSON when another tool must process the report:
 
 ```bash
 cxwatch report --json
 cxwatch estate --json
 ```
 
-The JSON output includes the report version, summary, findings, token counts, and fix data. Markdown output is suitable for review or for a separate cleanup task.
+The JSON includes the report version, summary, findings, token counts, and fix details.
 
-## Token counts and limits
+Use Markdown when a person or another agent must review the work:
 
-Session reports and file-based estate checks use the `o200k` tokenizer. Hook findings show the average token cost of one observed firing.
+```bash
+cxwatch explain path/to/run.jsonl -o session-report.md
+cxwatch estate -o cleanup.md
+```
 
-Detection depends on the transcript formats that each agent writes. Shell command analysis covers common file readers such as `cat`, `head`, `tail`, and `sed`. A report can miss operations that use a different event or command format.
+The estate plan groups findings by action and gives each item a concrete checklist entry.
+
+## Interactive controls
+
+### Session picker
+
+| Key | Action |
+|---|---|
+| Type text | Filter by agent, project, or prompt |
+| `Up` / `Down` | Move through sessions |
+| `Enter` | Audit the selected session |
+| `Ctrl+E` | Open the estate audit |
+| `Tab` | Enable or disable semantic analysis |
+| `Esc` | Clear the filter, or exit when the filter is empty |
+| `Ctrl+C` | Exit |
+
+### Report view
+
+| Key | Action |
+|---|---|
+| `Up` / `Down` | Scroll |
+| `Enter` | Show the proposed estate fix |
+| `f` twice | Confirm and apply a mechanical estate fix |
+| `e` | Export a Markdown report |
+| `Esc` | Return to the picker |
+| `q` | Exit |
+
+The `Enter` and `f` actions apply only to estate findings.
+
+## Accuracy and limits
+
+- Token counts use the `o200k` tokenizer. They are estimates, not provider billing data.
+- The report depends on the transcript formats that each agent writes.
+- Shell analysis recognizes common file readers such as `cat`, `head`, `tail`, and `sed`.
+- An estate use count includes only the transcripts that are available on the computer.
+- The semantic pass can find nuanced problems, but its output still needs review.
+- cxwatch audits context. It does not compact or rewrite an active session.
 
 ## Development
 
-Run the test suite:
+Run the checks:
 
 ```bash
 cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
-The terminal recording uses [VHS](https://github.com/charmbracelet/vhs):
-
-```bash
-brew install vhs
-vhs demo.tape
-ffmpeg -y -i demo.mp4 -vf "fps=15,scale=1200:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle" demo.gif
-```
-
-`vhs` records the source video. `ffmpeg` creates a smaller GIF for the README.
-
-The recording can contain real session names and findings from your computer. Review `demo.gif` and `demo.mp4` before you publish them.
+The terminal demo uses [VHS](https://github.com/charmbracelet/vhs). The repository includes `demo.tape` and the generated `demo.gif`. The recording can contain real project names and local findings. Review the media before you publish it.
 
 ## License
 
-This project uses the MIT License. See [LICENSE](LICENSE).
+cxwatch uses the MIT License. See [LICENSE](LICENSE).

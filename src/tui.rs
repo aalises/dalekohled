@@ -12,7 +12,7 @@ use ratatui::{
 pub(crate) fn pick(semantic_on: bool) -> Result<()> {
     let sessions = crate::sessions();
     if sessions.is_empty() {
-        anyhow::bail!("no sessions found under ~/.pi, ~/.claude or ~/.codex");
+        anyhow::bail!("no sessions found for Claude Code, Codex, pi, or OpenCode");
     }
     let mut terminal = ratatui::init();
     let res = App::new(sessions, semantic_on).run(&mut terminal);
@@ -308,12 +308,16 @@ impl App {
                             });
                         } else {
                             self.pending_fix = Some(sel);
-                            self.flash =
-                                Some(format!("apply: {} — press f again to confirm", op.describe()));
+                            self.flash = Some(format!(
+                                "apply: {} — press f again to confirm",
+                                op.describe()
+                            ));
                         }
                     }
                     Some(Some(_)) => {
-                        self.flash = Some("no mechanical fix for this row — use the exported plan (e)".into());
+                        self.flash = Some(
+                            "no mechanical fix for this row — use the exported plan (e)".into(),
+                        );
                     }
                     _ => {}
                 }
@@ -616,7 +620,10 @@ fn estate_header(r: &crate::estate::EstateReport) -> Vec<Line<'static>> {
 
 fn estate_lines(
     r: &crate::estate::EstateReport,
-) -> (Vec<Line<'static>>, Vec<Option<(String, crate::estate::FixOp)>>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<Option<(String, crate::estate::FixOp)>>,
+) {
     let mut out = Vec::new();
     let mut fixes = Vec::new();
     if r.findings.is_empty() {
