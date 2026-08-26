@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "Audit stale session context and unused configuration for AI coding agents"
 license = "MIT"
 repository = "https://github.com/aalises/dalekohled"
+homepage = "https://github.com/aalises/dalekohled"
 readme = "README.md"
 exclude = [".github", "demo.mp4", "demo.tape"]
 
@@ -17,3 +18,8 @@ anyhow = "1"
 crossterm = "0.29.0"
 ratatui = "0.30.2"
 tiktoken-rs = "0.12.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
