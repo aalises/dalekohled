@@ -57,6 +57,13 @@ enum Cmd {
         #[arg(long)]
         semantic: bool,
     },
+    /// One-line rot-o-meter for the most recent session (tmux status, shell prompts)
+    Status {
+        /// Specific session (file path or opencode:<id>); default: most recent
+        session: Option<PathBuf>,
+    },
+    /// Rot-o-meter for Claude Code's statusLine: reads the statusline JSON on stdin
+    Statusline,
     /// Audit static context (skills, commands, MCP, memory) against observed usage
     Estate {
         /// Emit JSON
@@ -68,6 +75,12 @@ enum Cmd {
         /// Write an agent-ready Markdown pruning plan to this file
         #[arg(short, long)]
         output: Option<String>,
+        /// Interactively apply mechanical fixes (backups go to ~/.cache/cxwatch/trash)
+        #[arg(long)]
+        fix: bool,
+        /// With --fix: apply all mechanical fixes without prompting
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -81,12 +94,16 @@ fn main() -> Result<()> {
         }) => report_cmd(session, json, semantic),
         Some(Cmd::Explain { session, output }) => explain_cmd(session, output),
         Some(Cmd::Sessions) => sessions_cmd(),
+        Some(Cmd::Status { session }) => status_cmd(session),
+        Some(Cmd::Statusline) => statusline_cmd(),
         Some(Cmd::Pick { semantic }) => tui::pick(semantic),
         Some(Cmd::Estate {
             json,
             semantic,
             output,
-        }) => estate::estate_cmd(json, semantic, output),
+            fix,
+            yes,
+        }) => estate::estate_cmd(json, semantic, output, fix, yes),
     }
 }
 
@@ -1246,10 +1263,122 @@ fn sessions_cmd() -> Result<()> {
     Ok(())
 }
 
+// ---------- rot-o-meter ----------
+
+fn statusline_cmd() -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    status_cmd(transcript_from_statusline_json(&input))
+}
+
+fn status_cmd(session: Option<PathBuf>) -> Result<()> {
+    let (path, label) = match session {
+        Some(p) => {
+            let l = source_of_path(&p);
+            (p, l)
+        }
+        None => {
+            let s = sessions()
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no sessions found"))?;
+            (s.path, s.source.label())
+        }
+    };
+    println!("{}", status_line(&path, label));
+    Ok(())
+}
+
+fn transcript_from_statusline_json(input: &str) -> Option<PathBuf> {
+    serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|v| v["transcript_path"].as_str().map(PathBuf::from))
+}
+
+fn source_of_path(p: &Path) -> &'static str {
+    let s = p.to_string_lossy();
+    if s.starts_with("opencode:") {
+        "opencode"
+    } else if s.contains("/.claude/") {
+        "claude"
+    } else if s.contains("/.codex/") {
+        "codex"
+    } else if s.contains("/.pi/") {
+        "pi"
+    } else {
+        "session"
+    }
+}
+
+/// One-line rot summary, cached by session size so statusline refreshes are instant.
+fn status_line(path: &Path, label: &str) -> String {
+    let key = path.display().to_string();
+    let size = session_size(path);
+    let cache_file = cache_dir().join("status.json");
+    let mut cache: Value = std::fs::read_to_string(&cache_file)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if cache[&key]["size"].as_u64() == Some(size) {
+        if let Some(line) = cache[&key]["line"].as_str() {
+            return line.to_string();
+        }
+    }
+    let line = match parse(path) {
+        Err(e) => format!("[{label}] cxwatch: {e}"),
+        Ok(events) => {
+            let r = build_report(key.clone(), &events, None);
+            let s = &r.summary;
+            format!(
+                "[{label}] rot {:>3}% {} ~{} tok reclaimable · {} findings",
+                s.reclaimable_pct,
+                meter(s.reclaimable_pct),
+                tok_fmt(s.reclaimable_tokens),
+                s.findings
+            )
+        }
+    };
+    cache[&key] = serde_json::json!({"size": size, "line": line});
+    let _ = std::fs::write(&cache_file, cache.to_string());
+    line
+}
+
+fn session_size(path: &Path) -> u64 {
+    if path.to_string_lossy().starts_with("opencode:") {
+        // any write to the db invalidates; over-invalidation is fine
+        opencode_db().metadata().map(|m| m.len()).unwrap_or(0)
+    } else {
+        path.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+pub(crate) fn cache_dir() -> PathBuf {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let dir = home.join(".cache/cxwatch");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn meter(pct: usize) -> String {
+    let filled = (pct.min(100) + 5) / 10;
+    format!("{}{}", "█".repeat(filled), "░".repeat(10usize.saturating_sub(filled)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rot_meter_and_statusline_json() {
+        assert_eq!(meter(0), "░░░░░░░░░░");
+        assert_eq!(meter(66), "███████░░░");
+        assert_eq!(meter(100), "██████████");
+        let j = r#"{"session_id":"s","transcript_path":"/tmp/x.jsonl","model":{"id":"m"}}"#;
+        assert_eq!(transcript_from_statusline_json(j), Some(PathBuf::from("/tmp/x.jsonl")));
+        assert_eq!(transcript_from_statusline_json("not json"), None);
+    }
 
     fn pi_call(id: &str, call_id: &str, name: &str, args: Value) -> Event {
         parse_line(
