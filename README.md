@@ -1,29 +1,43 @@
-# dalekohled 🔭
+# cxwatch 🔭
 
-> *dalekohled* (Czech: telescope) — a linter for your AI agents' context.
+**Find stale session context and unused agent configuration before they waste tokens.**
 
-Same way a code linter says *"unused variable, dead import, these two things conflict"* — but for your
-CLAUDE.md, skills, memory files, MCP servers, hooks and session transcripts. The CLI is called **`cxwatch`**.
+`cxwatch` is the command-line tool in the `dalekohled` project. It audits the context of AI coding agents such as Claude Code, Codex, pi, and OpenCode.
 
-![demo](demo.gif)
+![cxwatch terminal demo](demo.gif)
 
-Every agent with tool access eventually **rots its own context**: file reads go stale after edits, tool
-outputs get rerun and superseded, thinking blocks bloat. And the *static* estate rots too — skills nobody
-invokes, MCP servers nobody calls, memories pointing at deleted paths, directives that contradict each
-other. Harnesses handle this with blind threshold compaction. `cxwatch` tells you *what* is decaying,
-*why*, *how many tokens* it costs — and *how to fix it*.
+Coding agents collect context while they work. An old file read can remain after an edit. A large tool result can stay in the session after it is no longer useful. Skills, MCP servers, commands, hooks, and memory files can also remain configured after you stop using them.
 
-Two tiers, like a linter:
+`cxwatch` finds this waste and shows:
 
-- **Script tier** — deterministic and fast. Parses transcripts and the file estate, prices every unit in
-  tokens, and joins what's *declared* against what the transcripts show is *used*.
-- **LLM tier** (`--semantic`) — contradiction and duplication analysis across instruction prose, fed with
-  the real usage stats so it can catch "this directive disagrees with observed behavior".
+- what is stale, large, duplicated, or unused;
+- how many tokens each finding costs;
+- the evidence for each finding;
+- the file or command that can fix it.
+
+The default checks are deterministic and local. `cxwatch` only reports findings. It does not change your files or configuration.
+
+## Quick start
+
+```bash
+cxwatch
+```
+
+The interactive view lists recent sessions from all supported agents. Select a session to see the largest context problems first. Press `Ctrl+E` to open the static context audit.
+
+You can also run direct commands:
+
+```bash
+cxwatch report                    # Audit the most recent session
+cxwatch report path/to/run.jsonl  # Audit one session file
+cxwatch estate                    # Audit static agent configuration
+cxwatch estate -o cleanup.md      # Write a cleanup report
+cxwatch estate --json             # Return machine-readable output
+```
 
 ## Install
 
-Requires [Rust](https://rustup.rs) (edition 2024). Optional: the `pi` CLI on your PATH for `--semantic`
-passes, and the `sqlite3` binary (preinstalled on macOS) for OpenCode sessions.
+You need Rust 1.88 or later.
 
 ```bash
 git clone https://github.com/aalises/dalekohled.git
@@ -31,129 +45,127 @@ cd dalekohled
 cargo install --path .
 ```
 
-Or straight from the repo (uses your git credentials):
+You can also install from GitHub:
 
 ```bash
 cargo install --git https://github.com/aalises/dalekohled
 ```
 
-## Quick start
+OpenCode support needs the `sqlite3` command. macOS includes this command by default.
 
-```bash
-cxwatch                    # TUI: pick a session, get an interactive rot report
-cxwatch estate             # audit static context (skills/commands/MCP/memory/hooks)
-cxwatch estate --semantic -o plan.md   # agent-ready fix report
-```
+## What cxwatch audits
 
-All commands:
+### Session context
 
-```bash
-cxwatch                    # TUI picker (ctrl+e inside opens the estate control panel)
-cxwatch pick --semantic    # start with the LLM pass enabled
-cxwatch report [path]      # scan a session (default: most recent across harnesses)
-cxwatch report --json      # machine-readable
-cxwatch explain [path]     # write a Markdown session report
-cxwatch sessions           # flat list of all sessions
-cxwatch estate             # static-context audit, ledger to stdout
-cxwatch estate --json      # machine-readable (includes per-finding `path` and `fix`)
-cxwatch estate --semantic -o plan.md   # fix report with LLM contradiction/duplication findings
-```
+The session audit checks the transcript of one agent run.
 
-### TUI keys
+| Check | What it finds |
+|---|---|
+| `stale-read` | A file read that appears before a later edit of the same file |
+| `superseded-read` | A file read that appears before a later read of the same file |
+| `huge-thinking` | A reasoning block with more than 2,000 tokens |
+| `huge-output` | A tool result with more than 2,500 tokens |
 
-- **picker** — type to filter (fzf-style), `↑↓` move, `enter` analyze,
-  `ctrl+e` estate control panel, `tab` toggle semantic, `esc` clear filter / quit
-- **report / estate** — `↑↓` scroll, `enter` show the concrete fix, `e` export Markdown,
-  `esc` back, `q` quit
+For stale and superseded reads, `cxwatch` assigns the token cost of the related tool result. This shows the context that the session can reclaim.
 
-## Session rules (context rot)
+### Static context
 
-Four deterministic rules, each priced by the **tool result** it would reclaim
-(results are linked to calls via `toolCallId` / `tool_use_id` / `call_id`):
+The estate audit compares configured context with observed use in local transcripts.
 
-- `stale-read` — a file was read, then edited later → the read in context no longer matches disk
-- `superseded-read` — the same file was read again later → the earlier copy is dead weight
-  (covers shell reads too: `cat`, `head`, `sed -n`, …)
-- `huge-thinking` — thinking blocks over 2 000 tokens → condense candidates
-- `huge-output` — a single tool result over 2 500 tokens → trim or summarize
+| Check | What it finds |
+|---|---|
+| `dead-mcp` | An MCP server with no observed calls in its agent |
+| `dead-skill` | A skill with no observed use after a 14-day grace period |
+| `dead-command` | A Claude Code command with no observed use |
+| `duplicate-directive` | Repeated skill guidance in `CLAUDE.md` |
+| `hook-tax` | Large payloads from Claude Code hooks |
+| `orphan-memory` | A memory file that is absent from `MEMORY.md` |
+| `dangling-index` | A `MEMORY.md` entry for a missing file |
+| `stale-ref` | An instruction or memory file that refers to a missing path |
+| `stale-memory` | A memory file that has not changed for 120 days |
+| `heavy-block` | An instruction section with more than 400 tokens |
 
-Reads *after* the last edit are fresh and never flagged. Findings sort by reclaimable tokens.
+The cleanup report groups findings by action. Each item includes a path, evidence, and a proposed fix. Review all deletion and configuration changes before you apply them.
 
-## Estate audit (the linter part)
+## Supported agents
 
-Session rot is linear waste — it dies with the session. **Static context rot is multiplied waste**:
-every byte of skills, instructions, MCP config, memory and hook payloads is paid on every request of
-every session. `cxwatch estate` joins the declared estate against observed usage:
-
-| rule | what it catches | action |
+| Agent | Session source | Static context source |
 |---|---|---|
-| `dead-mcp` | MCP server mounted, 0 calls in that harness (notes cross-harness usage) | disable |
-| `dead-skill` | skill never invoked (claude: Skill tool/slash; codex/pi: SKILL.md reads) | delete or demote |
-| `duplicate-directive` | skill referenced repeatedly in CLAUDE.md on top of its description | merge |
-| `hook-tax` | tokens hooks inject per session, measured from observed payloads | review |
-| `dead-command` | custom slash command never used | delete |
-| `orphan-memory` | memory file missing from the MEMORY.md index — never loaded | repair index |
-| `dangling-index` | MEMORY.md entry pointing at a nonexistent file | repair index |
-| `stale-ref` | memory/instructions referencing filesystem paths that no longer exist | update |
-| `stale-memory` | memories unmodified for 120+ days | review |
-| `heavy-block` | a single CLAUDE.md/AGENTS.md heading block over 400 tokens | tighten |
+| Claude Code | `~/.claude/projects` | Skills, commands, memory, hooks, MCP servers, and `CLAUDE.md` |
+| Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` | Plugin skills, MCP servers, and `AGENTS.md` |
+| pi | `~/.pi/agent/sessions` | Package skills |
+| OpenCode | `~/.local/share/opencode/opencode.db` | `~/.config/opencode/AGENTS.md` |
 
-Token counts are real **o200k BPE** counts (not estimates). Instruction files are priced **per heading
-block** (see the blocks table in the fix report / JSON). Units tracked in a git repo get **age/churn
-signals** (`git: N commits, last change Xd ago`) in their finding details.
+## Semantic analysis
 
-The TUI estate view is a control panel: a stacked token bar by category, the ledger below, and `enter`
-on any finding reveals its concrete fix.
-
-## Fix reports for agents
-
-`cxwatch estate -o plan.md` writes an **executable fix report**: checklists grouped by action, each item
-carrying the exact remediation (`run \`claude mcp remove figma\``, the precise MEMORY.md line to append),
-the evidence, and the absolute file path — plus a preamble instructing the executing agent to confirm
-destructive steps with you. Hand it straight to an agent:
+The optional semantic pass looks for contradictions and repeated guidance that deterministic checks cannot find.
 
 ```bash
-cxwatch estate --semantic -o plan.md
-claude "work through plan.md"
+cxwatch report --semantic
+cxwatch estate --semantic -o cleanup.md
+cxwatch pick --semantic
 ```
 
-## Supported harnesses
+This pass needs the `pi` command. It uses the `moonshotai/kimi-k3` model by default. Set `CXWATCH_SEMANTIC_MODEL` to use a different model.
 
-| harness     | sessions                                  | estate                                          |
-|-------------|-------------------------------------------|-------------------------------------------------|
-| Claude Code | `~/.claude/projects`                       | skills, commands, memory, hooks, `~/.claude.json` MCP |
-| Codex       | `~/.codex/{sessions,archived_sessions}`    | `config.toml` MCP, plugin skills, AGENTS.md     |
-| pi          | `~/.pi/agent/sessions`                     | npm package skills                              |
-| OpenCode    | `~/.local/share/opencode/opencode.db` (sqlite; sessions addressable as `opencode:<id>`) | AGENTS.md |
+Important: the semantic pass sends a limited digest to the model through `pi`. The digest can contain session messages, instructions, skills, and memory text. Do not use `--semantic` until you have checked the data policy and configuration of your model provider. The default audit does not send this content to a model.
 
-Usage is mined from each harness's own transcripts; skills newer than 14 days get a grace period.
-Everything is report-only — the human (or their agent, with confirmation) decides what to delete.
+## Interactive controls
 
-## Demo
+Session picker:
 
-The recording is made with [VHS](https://github.com/charmbracelet/vhs) (by Charm): you script the
-keystrokes in a `.tape` file (`Type "cxwatch"`, `Ctrl+E`, `Sleep 3.5s`, …), and VHS replays them into a
-real headless terminal and renders every frame to GIF/MP4 — themes, fonts and padding included. The demo
-is *code*: deterministic, diffable, and re-recordable after every feature.
+- Type to filter the list.
+- Use `Up` and `Down` to move.
+- Press `Enter` to audit a session.
+- Press `Ctrl+E` to open the estate audit.
+- Press `Tab` to enable or disable semantic analysis.
+- Press `Esc` to clear the filter or exit.
+
+Report and estate views:
+
+- Use `Up` and `Down` to scroll.
+- Press `Enter` to show the proposed fix for an estate finding.
+- Press `E` to export a Markdown report.
+- Press `Esc` to return to the picker.
+- Press `Q` to exit.
+
+## Output for scripts
+
+Use JSON output when another tool must process the findings:
 
 ```bash
-brew install vhs
-vhs demo.tape        # regenerates demo.gif + demo.mp4
+cxwatch report --json
+cxwatch estate --json
 ```
 
-Note: recordings show real session previews and estate findings from the machine they run on — review
-before sharing.
+The JSON output includes the report version, summary, findings, token counts, and fix data. Markdown output is suitable for review or for a separate cleanup task.
 
-## Tests
+## Token counts and limits
+
+Session reports and file-based estate checks use the `o200k` tokenizer. Hook findings show the average token cost of one observed firing.
+
+Detection depends on the transcript formats that each agent writes. Shell command analysis covers common file readers such as `cat`, `head`, `tail`, and `sed`. A report can miss operations that use a different event or command format.
+
+## Development
+
+Run the test suite:
 
 ```bash
 cargo test
 ```
 
-## Roadmap
+The terminal recording uses [VHS](https://github.com/charmbracelet/vhs):
 
-1. ~~multi-harness parsers, result-linked token accounting, TUI, estate audit, fix reports~~ ✅
-2. ~~real o200k tokenizer, git age/churn signals, per-block instruction pricing, OpenCode support~~ ✅
-3. LLM tier v2: atomic-claim decomposition, content-hash caching, re-run on file change
-4. more harnesses (Gemini CLI, Goose, Cline) — added when there's real session data to validate against
-5. `cxwatch daemon` — per-session watcher, real-time notifications, pluggable rules
+```bash
+brew install vhs
+vhs demo.tape
+ffmpeg -y -i demo.mp4 -vf "fps=15,scale=1200:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle" demo.gif
+```
+
+`vhs` records the source video. `ffmpeg` creates a smaller GIF for the README.
+
+The recording can contain real session names and findings from your computer. Review `demo.gif` and `demo.mp4` before you publish them.
+
+## License
+
+This project uses the MIT License. See [LICENSE](LICENSE).

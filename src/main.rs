@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::Value;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -12,11 +13,18 @@ use std::time::SystemTime;
 pub(crate) const REPORT_VERSION: u8 = 2;
 const THINKING_THRESHOLD: usize = 2_000;
 const OUTPUT_THRESHOLD: usize = 2_500;
-pub(crate) const SEMANTIC_MODEL: &str = "moonshotai/kimi-k3";
+pub(crate) const DEFAULT_SEMANTIC_MODEL: &str = "moonshotai/kimi-k3";
 const SEMANTIC_DIGEST_CAP: usize = 60_000;
 
+pub(crate) fn semantic_model() -> String {
+    std::env::var("CXWATCH_SEMANTIC_MODEL").unwrap_or_else(|_| DEFAULT_SEMANTIC_MODEL.into())
+}
+
 #[derive(Parser)]
-#[command(name = "cxwatch", about = "Context hygiene for agent sessions (pi, Claude Code, Codex)")]
+#[command(
+    name = "cxwatch",
+    about = "Context hygiene for agent sessions (pi, Claude Code, Codex)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -66,11 +74,19 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         None => tui::pick(false),
-        Some(Cmd::Report { session, json, semantic }) => report_cmd(session, json, semantic),
+        Some(Cmd::Report {
+            session,
+            json,
+            semantic,
+        }) => report_cmd(session, json, semantic),
         Some(Cmd::Explain { session, output }) => explain_cmd(session, output),
         Some(Cmd::Sessions) => sessions_cmd(),
         Some(Cmd::Pick { semantic }) => tui::pick(semantic),
-        Some(Cmd::Estate { json, semantic, output }) => estate::estate_cmd(json, semantic, output),
+        Some(Cmd::Estate {
+            json,
+            semantic,
+            output,
+        }) => estate::estate_cmd(json, semantic, output),
     }
 }
 
@@ -136,14 +152,24 @@ pub(crate) fn sessions() -> Vec<SessionMeta> {
         walk_jsonl(&root, &mut files);
         for path in files {
             let md = path.metadata().ok();
-            let modified = md.as_ref().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
+            let modified = md
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
             let size = md.map(|m| m.len()).unwrap_or(0);
             let title = title_for(source, &path);
-            out.push(SessionMeta { source, path, title, modified, size, preview: None });
+            out.push(SessionMeta {
+                source,
+                path,
+                title,
+                modified,
+                size,
+                preview: None,
+            });
         }
     }
     opencode_sessions(&mut out);
-    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out.sort_by_key(|session| Reverse(session.modified));
     out
 }
 
@@ -182,7 +208,11 @@ fn opencode_sessions(out: &mut Vec<SessionMeta>) {
     for r in rows {
         let Some(id) = r["id"].as_str() else { continue };
         let dir = r["dir"].as_str().unwrap_or("?");
-        let title = dir.strip_prefix(&home).unwrap_or(dir).trim_start_matches('/').to_string();
+        let title = dir
+            .strip_prefix(&home)
+            .unwrap_or(dir)
+            .trim_start_matches('/')
+            .to_string();
         out.push(SessionMeta {
             source: Source::OpenCode,
             path: PathBuf::from(format!("opencode:{id}")),
@@ -215,14 +245,21 @@ fn parse_opencode(id: &str) -> Result<Vec<Event>> {
     for r in &rows {
         let mid = r["mid"].as_str().unwrap_or("");
         let role = r["role"].as_str().unwrap_or("unknown");
-        let part: Value = r["data"].as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+        let part: Value = r["data"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(Value::Null);
         let items = opencode_items(&part);
         if items.is_empty() {
             continue;
         }
         match events.last_mut() {
             Some(ev) if ev.id == mid => ev.items.extend(items),
-            _ => events.push(Event { id: mid.to_string(), role: role.to_string(), items }),
+            _ => events.push(Event {
+                id: mid.to_string(),
+                role: role.to_string(),
+                items,
+            }),
         }
     }
     Ok(events)
@@ -249,7 +286,11 @@ fn opencode_items(part: &Value) -> Vec<Item> {
 }
 
 fn title_for(source: Source, path: &Path) -> String {
-    let parent = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or("");
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     match source {
         // dir name encodes the cwd, e.g. "--Users-me-dev-cxwatch--" / "-Users-me-dev-cxwatch"
         Source::Pi | Source::Claude => decode_slug(parent),
@@ -257,7 +298,10 @@ fn title_for(source: Source, path: &Path) -> String {
         Source::OpenCode => String::new(),
         // filename: rollout-<date>T<time>-<uuid>.jsonl
         Source::Codex => {
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("session");
             let s = stem.strip_prefix("rollout-").unwrap_or(stem);
             if s.len() > 37 {
                 format!("{} {}", &s[..s.len() - 37], &s[s.len() - 36..s.len() - 28])
@@ -271,8 +315,15 @@ fn title_for(source: Source, path: &Path) -> String {
 pub(crate) fn decode_slug(slug: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default().replace('/', "-");
     let t = slug.trim_matches('-');
-    let t = t.strip_prefix(home.trim_matches('-')).unwrap_or(t).trim_matches('-');
-    if t.is_empty() { "~".into() } else { t.replace('-', "/") }
+    let t = t
+        .strip_prefix(home.trim_matches('-'))
+        .unwrap_or(t)
+        .trim_matches('-');
+    if t.is_empty() {
+        "~".into()
+    } else {
+        t.replace('-', "/")
+    }
 }
 
 fn latest_session() -> Result<PathBuf> {
@@ -286,10 +337,14 @@ fn latest_session() -> Result<PathBuf> {
 /// First real user prompt of a session, for the picker. Scans only the head of the file.
 pub(crate) fn preview(source: Source, path: &Path) -> String {
     use std::io::{BufRead, BufReader, Read};
-    let Ok(f) = std::fs::File::open(path) else { return String::new() };
+    let Ok(f) = std::fs::File::open(path) else {
+        return String::new();
+    };
     let reader = BufReader::new(f.take(512 * 1024));
     for line in reader.lines().map_while(Result::ok).take(120) {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let text = match source {
             Source::Pi => (v["type"] == "message" && v["message"]["role"] == "user")
                 .then(|| first_text(&v["message"]["content"]))
@@ -308,7 +363,8 @@ pub(crate) fn preview(source: Source, path: &Path) -> String {
         if let Some(t) = text {
             let t = t.trim();
             // skip injected context: tags, caveats, AGENTS.md preambles
-            if t.is_empty() || t.starts_with('<') || t.starts_with('#') || t.starts_with("Caveat:") {
+            if t.is_empty() || t.starts_with('<') || t.starts_with('#') || t.starts_with("Caveat:")
+            {
                 continue;
             }
             return clip(&t.split_whitespace().collect::<Vec<_>>().join(" "), 100);
@@ -331,7 +387,7 @@ fn first_text(content: &Value) -> Option<String> {
 
 // ---------- unified event model ----------
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Action {
     Read,
     Mutate,
@@ -341,8 +397,15 @@ pub(crate) enum Action {
 pub(crate) enum Item {
     Text(String),
     Thinking(String),
-    ToolCall { call_id: String, desc: String, targets: Vec<(Action, String)> },
-    ToolResult { call_id: String, tokens: usize },
+    ToolCall {
+        call_id: String,
+        desc: String,
+        targets: Vec<(Action, String)>,
+    },
+    ToolResult {
+        call_id: String,
+        tokens: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -380,14 +443,26 @@ fn parse_line(v: &Value) -> Option<Event> {
                     }],
                 });
             }
-            Some(Event { id, role, items: body_items(&m["content"]) })
+            Some(Event {
+                id,
+                role,
+                items: body_items(&m["content"]),
+            })
         }
         // Claude Code: {"type":"user"|"assistant","uuid":..,"message":{"role":..,"content":str|[..]}}
         "user" | "assistant" => {
             let m = &v["message"];
             let id = v["uuid"].as_str().unwrap_or("").to_string();
-            let role = m["role"].as_str().or(v["type"].as_str()).unwrap_or("unknown").to_string();
-            Some(Event { id, role, items: body_items(&m["content"]) })
+            let role = m["role"]
+                .as_str()
+                .or(v["type"].as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            Some(Event {
+                id,
+                role,
+                items: body_items(&m["content"]),
+            })
         }
         // Codex: {"type":"response_item","payload":{"type":"message"|"function_call"|..}}
         "response_item" => {
@@ -399,7 +474,12 @@ fn parse_line(v: &Value) -> Option<Event> {
                     items: p["content"]
                         .as_array()?
                         .iter()
-                        .filter(|i| matches!(i["type"].as_str(), Some("input_text" | "output_text" | "text")))
+                        .filter(|i| {
+                            matches!(
+                                i["type"].as_str(),
+                                Some("input_text" | "output_text" | "text")
+                            )
+                        })
                         .map(|i| Item::Text(i["text"].as_str().unwrap_or("").into()))
                         .collect(),
                 }),
@@ -417,12 +497,27 @@ fn parse_line(v: &Value) -> Option<Event> {
                         items: vec![tool_call_item(call_id, name, &args)],
                     })
                 }
-                "function_call_output" => {
+                "custom_tool_call" => {
+                    let call_id = p["call_id"].as_str().unwrap_or("").to_string();
+                    Some(Event {
+                        id: call_id.clone(),
+                        role: "assistant".into(),
+                        items: vec![custom_tool_call_item(
+                            call_id,
+                            p["name"].as_str().unwrap_or(""),
+                            p["input"].as_str().unwrap_or(""),
+                        )],
+                    })
+                }
+                "function_call_output" | "custom_tool_call_output" => {
                     let call_id = p["call_id"].as_str().unwrap_or("").to_string();
                     Some(Event {
                         id: call_id.clone(),
                         role: "tool".into(),
-                        items: vec![Item::ToolResult { call_id, tokens: estimate_tokens(&text_of(&p["output"])) }],
+                        items: vec![Item::ToolResult {
+                            call_id,
+                            tokens: estimate_tokens(&text_of(&p["output"])),
+                        }],
                     })
                 }
                 "reasoning" => {
@@ -481,11 +576,35 @@ fn tool_call_item(call_id: String, name: &str, args: &Value) -> Item {
     let desc = if let Some((_, p)) = targets.first() {
         format!("{name} {p}")
     } else if let Some(c) = args["command"].as_str().or(args["cmd"].as_str()) {
-        format!("{name} `{}`", clip(&c.split_whitespace().collect::<Vec<_>>().join(" "), 48))
+        format!(
+            "{name} `{}`",
+            clip(&c.split_whitespace().collect::<Vec<_>>().join(" "), 48)
+        )
     } else {
         name.to_string()
     };
-    Item::ToolCall { call_id, desc, targets }
+    Item::ToolCall {
+        call_id,
+        desc,
+        targets,
+    }
+}
+
+fn custom_tool_call_item(call_id: String, name: &str, input: &str) -> Item {
+    let targets = match name {
+        "apply_patch" => patch_targets(input),
+        "exec" => exec_script_targets(input),
+        _ => Vec::new(),
+    };
+    let desc = targets
+        .first()
+        .map(|(_, path)| format!("{name} {path}"))
+        .unwrap_or_else(|| name.to_string());
+    Item::ToolCall {
+        call_id,
+        desc,
+        targets,
+    }
 }
 
 fn tool_targets(name: &str, args: &Value) -> Vec<(Action, String)> {
@@ -505,44 +624,128 @@ fn tool_targets(name: &str, args: &Value) -> Vec<(Action, String)> {
                 .as_str()
                 .map(String::from)
                 .or_else(|| {
-                    args["command"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
+                    args["command"].as_array().map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
                 })
                 .or_else(|| args["cmd"].as_str().map(String::from));
-            cmd.map(|c| shell_read_targets(&c)).unwrap_or_default()
+            cmd.map(|c| shell_targets(&c)).unwrap_or_default()
         }
         "apply_patch" => patch_targets(args["input"].as_str().unwrap_or("")),
         _ => vec![],
     }
 }
 
-/// Detect file reads done through the shell (cat/head/sed -n ... — how Codex reads files).
-fn shell_read_targets(cmd: &str) -> Vec<(Action, String)> {
+/// Detect common file reads and edits in shell commands.
+fn shell_targets(cmd: &str) -> Vec<(Action, String)> {
     let mut out = Vec::new();
     for seg in cmd.replace("&&", ";").split(['|', ';', '\n']) {
         let toks: Vec<&str> = seg.split_whitespace().collect();
         let Some(&first) = toks.first() else { continue };
         let is_reader = matches!(first, "cat" | "head" | "tail" | "less" | "more" | "bat")
-            || (first == "sed" && !toks.contains(&"-i"));
-        if is_reader {
-            if let Some(p) = last_pathish(&toks[1..]) {
-                out.push((Action::Read, p));
+            || (first == "sed" && !toks.iter().any(|t| t.starts_with("-i")));
+        if is_reader && let Some(path) = last_pathish(&toks[1..]) {
+            out.push((Action::Read, path));
+        }
+        let mutates_last = (first == "sed" && toks.iter().any(|t| t.starts_with("-i")))
+            || matches!(first, "tee" | "cp" | "install");
+        if mutates_last {
+            if let Some(path) = last_pathish(&toks[1..]) {
+                out.push((Action::Mutate, path));
+            }
+        } else if matches!(first, "mv" | "rm" | "unlink" | "truncate") {
+            out.extend(
+                toks[1..]
+                    .iter()
+                    .filter_map(|t| pathish(t).map(|p| (Action::Mutate, p))),
+            );
+        }
+        for (i, tok) in toks.iter().enumerate() {
+            let path = match *tok {
+                ">" | ">>" => toks.get(i + 1).and_then(|t| pathish(t)),
+                _ => tok
+                    .strip_prefix(">>")
+                    .or_else(|| tok.strip_prefix('>'))
+                    .and_then(pathish),
+            };
+            if let Some(path) = path {
+                out.push((Action::Mutate, path));
+            }
+        }
+    }
+    dedup_targets(out)
+}
+
+fn last_pathish(toks: &[&str]) -> Option<String> {
+    toks.iter().rev().find_map(|t| pathish(t))
+}
+
+fn pathish(token: &str) -> Option<String> {
+    let token = token.trim_matches(|c| c == '\'' || c == '"');
+    (!token.is_empty()
+        && !token.starts_with('-')
+        && !token.starts_with(|c: char| c.is_ascii_digit())
+        && !token.contains(['$', '`', '*', '=']))
+    .then(|| token.to_string())
+}
+
+fn exec_script_targets(script: &str) -> Vec<(Action, String)> {
+    let mut targets = Vec::new();
+    for (start, value) in js_string_literals(script) {
+        let prefix = script[..start].trim_end();
+        if ["cmd:", "\"cmd\":", "'cmd':", "command:", "\"command\":"]
+            .iter()
+            .any(|key| prefix.ends_with(key))
+        {
+            targets.extend(shell_targets(&value));
+        }
+        if value.contains("*** Begin Patch") {
+            targets.extend(patch_targets(&value));
+        }
+    }
+    dedup_targets(targets)
+}
+
+fn js_string_literals(script: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut chars = script.char_indices().peekable();
+    while let Some((start, quote)) = chars.next() {
+        if !matches!(quote, '\'' | '"' | '`') {
+            continue;
+        }
+        let mut value = String::new();
+        let mut escaped = false;
+        for (_, ch) in chars.by_ref() {
+            if escaped {
+                value.push(match ch {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    other => other,
+                });
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                out.push((start, value));
+                break;
+            } else {
+                value.push(ch);
             }
         }
     }
     out
 }
 
-fn last_pathish(toks: &[&str]) -> Option<String> {
-    toks.iter().rev().find_map(|t| {
-        let t = t.trim_matches(|c| c == '\'' || c == '"');
-        (!t.is_empty()
-            && !t.starts_with('-')
-            && !t.starts_with(|c: char| c.is_ascii_digit())
-            && !t.contains(['$', '`', '*']))
-        .then(|| t.to_string())
-    })
+fn dedup_targets(targets: Vec<(Action, String)>) -> Vec<(Action, String)> {
+    let mut seen = HashSet::new();
+    targets
+        .into_iter()
+        .filter(|target| seen.insert(target.clone()))
+        .collect()
 }
 
 fn patch_targets(patch: &str) -> Vec<(Action, String)> {
@@ -569,7 +772,11 @@ pub(crate) fn estimate_tokens(text: &str) -> usize {
 fn text_of(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
-        Value::Array(a) => a.iter().filter_map(|i| i["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|i| i["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => String::new(),
     }
 }
@@ -615,7 +822,11 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
                         });
                     }
                 }
-                Item::ToolCall { call_id, desc, targets } => {
+                Item::ToolCall {
+                    call_id,
+                    desc,
+                    targets,
+                } => {
                     call_desc.insert(call_id.clone(), desc.clone());
                     for (action, path) in targets {
                         ops.push(Op {
@@ -638,6 +849,14 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
 
     // A read is dead weight if the same path is re-read later (superseded)
     // or edited later (stale). Reads after the last mutation are fresh.
+    let read_counts: HashMap<&str, usize> =
+        ops.iter()
+            .filter(|op| op.action == Action::Read)
+            .fold(HashMap::new(), |mut counts, op| {
+                *counts.entry(op.call_id.as_str()).or_default() += 1;
+                counts
+            });
+    let mut read_positions: HashMap<&str, usize> = HashMap::new();
     let mut flagged: HashSet<&str> = HashSet::new();
     for (i, op) in ops.iter().enumerate() {
         if op.action != Action::Read {
@@ -646,14 +865,23 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
         let later_read = ops[i + 1..]
             .iter()
             .find(|o| o.path == op.path && o.action == Action::Read && o.call_id != op.call_id);
-        let later_mutate = ops[i + 1..].iter().find(|o| o.path == op.path && o.action == Action::Mutate);
-        let tokens = result_tokens.get(&op.call_id).copied().unwrap_or(0);
+        let later_mutate = ops[i + 1..]
+            .iter()
+            .find(|o| o.path == op.path && o.action == Action::Mutate);
+        let total = result_tokens.get(&op.call_id).copied().unwrap_or(0);
+        let count = read_counts.get(op.call_id.as_str()).copied().unwrap_or(1);
+        let position = read_positions.entry(op.call_id.as_str()).or_default();
+        let tokens = total / count + usize::from(*position < total % count);
+        *position += 1;
         if let Some(r) = later_read {
             findings.push(Finding {
                 rule: "superseded-read",
                 event_idx: op.idx,
                 event_id: op.id.clone(),
-                detail: format!("{} re-read at #{} — this earlier copy is dead weight", op.path, r.idx),
+                detail: format!(
+                    "{} re-read at #{} — this earlier copy is dead weight",
+                    op.path, r.idx
+                ),
                 tokens,
             });
             flagged.insert(&op.call_id);
@@ -662,7 +890,10 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
                 rule: "stale-read",
                 event_idx: op.idx,
                 event_id: op.id.clone(),
-                detail: format!("{} edited at #{} — this read no longer matches disk", op.path, m.idx),
+                detail: format!(
+                    "{} edited at #{} — this read no longer matches disk",
+                    op.path, m.idx
+                ),
                 tokens,
             });
             flagged.insert(&op.call_id);
@@ -672,7 +903,10 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
     for (idx, id, call_id) in &results {
         let tokens = result_tokens.get(call_id).copied().unwrap_or(0);
         if tokens > OUTPUT_THRESHOLD && !flagged.contains(call_id.as_str()) {
-            let desc = call_desc.get(call_id).cloned().unwrap_or_else(|| "tool".into());
+            let desc = call_desc
+                .get(call_id)
+                .cloned()
+                .unwrap_or_else(|| "tool".into());
             findings.push(Finding {
                 rule: "huge-output",
                 event_idx: *idx,
@@ -683,7 +917,7 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
         }
     }
 
-    findings.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+    findings.sort_by_key(|finding| Reverse(finding.tokens));
     findings
 }
 
@@ -714,7 +948,11 @@ pub(crate) struct Report {
     pub summary: Summary,
 }
 
-pub(crate) fn build_report(session: String, events: &[Event], semantic: Option<Semantic>) -> Report {
+pub(crate) fn build_report(
+    session: String,
+    events: &[Event],
+    semantic: Option<Semantic>,
+) -> Report {
     let findings = analyze(events);
     let session_tokens: usize = events
         .iter()
@@ -778,12 +1016,29 @@ pub(crate) fn cap_middle(s: String, cap: usize) -> String {
 }
 
 pub(crate) fn llm_sections(prompt: &str) -> Result<Semantic> {
+    let model = semantic_model();
     let sh = std::process::Command::new("pi")
-        .args(["-p", prompt, "--model", SEMANTIC_MODEL])
+        .args(["-p", prompt, "--model", &model])
         .output()?;
+    if !sh.status.success() {
+        let detail = clip(String::from_utf8_lossy(&sh.stderr).trim(), 300);
+        anyhow::bail!(
+            "pi failed with status {}{}",
+            sh.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
     let stdout = String::from_utf8_lossy(&sh.stdout);
     let (contradiction, bloating) = parse_semantic_sections(&stdout);
-    Ok(Semantic { contradiction, bloating, model_used: SEMANTIC_MODEL.into() })
+    Ok(Semantic {
+        contradiction,
+        bloating,
+        model_used: model,
+    })
 }
 
 fn parse_semantic_sections(output: &str) -> (String, String) {
@@ -796,7 +1051,10 @@ fn parse_semantic_sections(output: &str) -> (String, String) {
         let u = t.to_uppercase();
         if u.contains("CONTRADICTION") {
             Some(0)
-        } else if ["BLOAT", "DUPLICATION", "REDUNDAN"].iter().any(|k| u.contains(k)) {
+        } else if ["BLOAT", "DUPLICATION", "REDUNDAN"]
+            .iter()
+            .any(|k| u.contains(k))
+        {
             Some(1)
         } else {
             None
@@ -810,14 +1068,20 @@ fn parse_semantic_sections(output: &str) -> (String, String) {
             cur = Some(i);
             continue;
         }
-        if let Some(i) = cur {
-            if t.starts_with("- ") || t.starts_with("* ") {
-                let body = t.trim_start_matches(['-', '*']).trim();
-                sections[i].push_str(&format!("- {body}\n"));
-            }
+        if let Some(i) = cur
+            && (t.starts_with("- ") || t.starts_with("* "))
+        {
+            let body = t.trim_start_matches(['-', '*']).trim();
+            sections[i].push_str(&format!("- {body}\n"));
         }
     }
-    let done = |s: String| if s.is_empty() { "(no findings)".to_string() } else { s.trim_end().to_string() };
+    let done = |s: String| {
+        if s.is_empty() {
+            "(no findings)".to_string()
+        } else {
+            s.trim_end().to_string()
+        }
+    };
     let [c, b] = sections;
     (done(c), done(b))
 }
@@ -825,11 +1089,18 @@ fn parse_semantic_sections(output: &str) -> (String, String) {
 // ---------- output ----------
 
 pub(crate) fn tok_fmt(n: usize) -> String {
-    if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 pub(crate) fn ago(t: SystemTime) -> String {
-    let secs = SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(t)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     match secs {
         0..=59 => format!("{}s", secs.max(1)),
         60..=3599 => format!("{}m", secs / 60),
@@ -852,7 +1123,10 @@ pub(crate) fn clip(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.into()
     } else {
-        format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(n.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
@@ -868,12 +1142,24 @@ fn human(r: &Report) {
         s.reclaimable_pct
     );
     for f in &r.findings {
-        println!("  {:<16} {:>8}  #{:<5} {}", f.rule, format!("~{}", tok_fmt(f.tokens)), f.event_idx, f.detail);
+        println!(
+            "  {:<16} {:>8}  #{:<5} {}",
+            f.rule,
+            format!("~{}", tok_fmt(f.tokens)),
+            f.event_idx,
+            f.detail
+        );
     }
     if let Some(sem) = &r.semantic {
         println!("  semantic ({}):", sem.model_used);
-        println!("    contradictions:\n      {}", sem.contradiction.replace('\n', "\n      "));
-        println!("    bloating:\n      {}", sem.bloating.replace('\n', "\n      "));
+        println!(
+            "    contradictions:\n      {}",
+            sem.contradiction.replace('\n', "\n      ")
+        );
+        println!(
+            "    bloating:\n      {}",
+            sem.bloating.replace('\n', "\n      ")
+        );
     }
 }
 
@@ -921,7 +1207,7 @@ fn load(session: Option<PathBuf>, want_semantic: bool) -> Result<Report> {
         semantic(&events).unwrap_or_else(|e| Semantic {
             contradiction: format!("semantic unavailable: {e}"),
             bloating: String::new(),
-            model_used: SEMANTIC_MODEL.into(),
+            model_used: semantic_model(),
         })
     });
     Ok(build_report(path.display().to_string(), &events, semantic))
@@ -966,14 +1252,18 @@ mod tests {
     use serde_json::json;
 
     fn pi_call(id: &str, call_id: &str, name: &str, args: Value) -> Event {
-        parse_line(&json!({"type":"message","id":id,"message":{"role":"assistant","content":[
-            {"type":"toolCall","id":call_id,"name":name,"arguments":args}]}}))
+        parse_line(
+            &json!({"type":"message","id":id,"message":{"role":"assistant","content":[
+            {"type":"toolCall","id":call_id,"name":name,"arguments":args}]}}),
+        )
         .unwrap()
     }
 
     fn pi_result(call_id: &str, text: &str) -> Event {
-        parse_line(&json!({"type":"message","id":"r","message":{"role":"toolResult",
-            "toolCallId":call_id,"content":[{"type":"text","text":text}]}}))
+        parse_line(
+            &json!({"type":"message","id":"r","message":{"role":"toolResult",
+            "toolCallId":call_id,"content":[{"type":"text","text":text}]}}),
+        )
         .unwrap()
     }
 
@@ -1020,8 +1310,10 @@ mod tests {
     fn huge_thinking() {
         let thinking = "thinking about the problem in detail ".repeat(500);
         assert!(estimate_tokens(&thinking) > 2000);
-        let ev = parse_line(&json!({"type":"message","id":"t","message":{"role":"assistant",
-            "content":[{"type":"thinking","thinking":thinking}]}}))
+        let ev = parse_line(
+            &json!({"type":"message","id":"t","message":{"role":"assistant",
+            "content":[{"type":"thinking","thinking":thinking}]}}),
+        )
         .unwrap();
         let f = analyze(&[ev]);
         assert_eq!(f.len(), 1);
@@ -1066,23 +1358,107 @@ mod tests {
             "state":{"status":"completed","input":{"filePath":"/a.rs"},"output":"file contents here"}});
         let items = opencode_items(&part);
         assert_eq!(items.len(), 2);
-        let Item::ToolCall { targets, .. } = &items[0] else { panic!("expected call") };
+        let Item::ToolCall { targets, .. } = &items[0] else {
+            panic!("expected call")
+        };
         assert_eq!(targets, &vec![(Action::Read, "/a.rs".to_string())]);
-        let Item::ToolResult { call_id, tokens } = &items[1] else { panic!("expected result") };
+        let Item::ToolResult { call_id, tokens } = &items[1] else {
+            panic!("expected result")
+        };
         assert_eq!(call_id, "c1");
         assert_eq!(*tokens, estimate_tokens("file contents here"));
-        assert!(matches!(opencode_items(&json!({"type":"reasoning","text":"hmm"}))[0], Item::Thinking(_)));
+        assert!(matches!(
+            opencode_items(&json!({"type":"reasoning","text":"hmm"}))[0],
+            Item::Thinking(_)
+        ));
         assert!(opencode_items(&json!({"type":"step-start"})).is_empty());
     }
 
     #[test]
     fn codex_function_call_string_args() {
-        let ev = parse_line(&json!({"type":"response_item","payload":{"type":"function_call",
+        let ev = parse_line(
+            &json!({"type":"response_item","payload":{"type":"function_call",
             "name":"exec_command","call_id":"c9",
-            "arguments":"{\"cmd\":\"ls && sed -n '1,240p' plan.md\"}"}}))
+            "arguments":"{\"cmd\":\"ls && sed -n '1,240p' plan.md\"}"}}),
+        )
         .unwrap();
-        let Item::ToolCall { targets, .. } = &ev.items[0] else { panic!("expected tool call") };
+        let Item::ToolCall { targets, .. } = &ev.items[0] else {
+            panic!("expected tool call")
+        };
         assert_eq!(targets, &[(Action::Read, "plan.md".to_string())]);
+    }
+
+    #[test]
+    fn codex_custom_tool_call_and_output_parse() {
+        let call = parse_line(&json!({"type":"response_item","payload":{
+            "type":"custom_tool_call","name":"apply_patch","call_id":"c10",
+            "input":"*** Begin Patch\n*** Update File: src/main.rs\n*** End Patch"}}))
+        .expect("custom tool call");
+        let Item::ToolCall { targets, .. } = &call.items[0] else {
+            panic!("expected tool call")
+        };
+        assert_eq!(targets, &[(Action::Mutate, "src/main.rs".to_string())]);
+
+        let result = parse_line(&json!({"type":"response_item","payload":{
+            "type":"custom_tool_call_output","call_id":"c10",
+            "output":[{"type":"input_text","text":"Done!"}]}}))
+        .expect("custom tool output");
+        let Item::ToolResult { call_id, tokens } = &result.items[0] else {
+            panic!("expected tool result")
+        };
+        assert_eq!(call_id, "c10");
+        assert_eq!(*tokens, estimate_tokens("Done!"));
+    }
+
+    #[test]
+    fn codex_custom_exec_extracts_nested_file_operations() {
+        let input = r#"const a = await tools.exec_command({cmd:"cat a.txt; sed -i 's/a/b/' b.txt"});
+const patch = "*** Begin Patch\n*** Update File: c.txt\n*** End Patch";
+await tools.apply_patch(patch);"#;
+        let call = parse_line(&json!({"type":"response_item","payload":{
+            "type":"custom_tool_call","name":"exec","call_id":"c11","input":input}}))
+        .expect("custom exec call");
+        let Item::ToolCall { targets, .. } = &call.items[0] else {
+            panic!("expected tool call")
+        };
+        assert_eq!(
+            targets,
+            &[
+                (Action::Read, "a.txt".into()),
+                (Action::Mutate, "b.txt".into()),
+                (Action::Mutate, "c.txt".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_result_is_not_counted_once_per_file() {
+        let payload = "contents from two files";
+        let events = vec![
+            pi_call("a", "c1", "bash", json!({"command":"cat a.txt; cat b.txt"})),
+            pi_result("c1", payload),
+            pi_call("b", "c2", "read", json!({"path":"a.txt"})),
+            pi_call("c", "c3", "read", json!({"path":"b.txt"})),
+        ];
+        let report = build_report("test".into(), &events, None);
+        assert_eq!(report.summary.reclaimable_tokens, estimate_tokens(payload));
+        assert!(report.summary.reclaimable_pct <= 100);
+    }
+
+    #[test]
+    fn shell_edits_are_mutations() {
+        let targets = tool_targets(
+            "exec_command",
+            &json!({"cmd":"cat a.txt; sed -i 's/a/b/' b.txt; printf x > c.txt"}),
+        );
+        assert_eq!(
+            targets,
+            vec![
+                (Action::Read, "a.txt".into()),
+                (Action::Mutate, "b.txt".into()),
+                (Action::Mutate, "c.txt".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1098,11 +1474,17 @@ mod tests {
 
     #[test]
     fn shell_reader_extraction() {
-        assert_eq!(shell_read_targets("cat /tmp/foo"), vec![(Action::Read, "/tmp/foo".into())]);
         assert_eq!(
-            shell_read_targets("ls | head -n 50 src/main.rs"),
+            shell_targets("cat /tmp/foo"),
+            vec![(Action::Read, "/tmp/foo".into())]
+        );
+        assert_eq!(
+            shell_targets("ls | head -n 50 src/main.rs"),
             vec![(Action::Read, "src/main.rs".into())]
         );
-        assert!(shell_read_targets("sed -i 's/a/b/' f.txt").is_empty());
+        assert_eq!(
+            shell_targets("sed -i 's/a/b/' f.txt"),
+            vec![(Action::Mutate, "f.txt".into())]
+        );
     }
 }

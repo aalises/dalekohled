@@ -1,7 +1,8 @@
-use crate::{tok_fmt, Semantic};
+use crate::{Semantic, tok_fmt};
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -60,8 +61,15 @@ pub(crate) struct EstateReport {
 #[derive(Default)]
 struct HookStat {
     fires: usize,
-    bytes: usize,
+    tokens: usize,
     sample: String,
+}
+
+#[derive(Clone, Copy)]
+enum Harness {
+    Claude,
+    Codex,
+    Pi,
 }
 
 #[derive(Default)]
@@ -69,53 +77,75 @@ struct Usage {
     claude_sessions: usize,
     codex_sessions: usize,
     pi_sessions: usize,
-    skills: HashMap<String, usize>,      // Skill tool invocations (claude)
-    commands: HashMap<String, usize>,    // slash commands (claude)
-    mcp_claude: HashMap<String, usize>,  // mcp__server__ calls per harness
+    skills: HashMap<String, usize>, // Skill tool invocations (claude)
+    commands: HashMap<String, usize>, // slash commands (claude)
+    mcp_claude: HashMap<String, usize>, // mcp__server__ calls per harness
     mcp_codex: HashMap<String, usize>,
     hooks: HashMap<String, HookStat>,
-    skill_reads: HashMap<String, usize>, // skills/<name>/SKILL.md reads, all harnesses
+    skill_reads_claude: HashMap<String, usize>,
+    skill_reads_codex: HashMap<String, usize>,
+    skill_reads_pi: HashMap<String, usize>,
 }
 
 fn scan_usage(home: &Path) -> Usage {
-    enum H {
-        Claude,
-        Codex,
-        Pi,
-    }
     let mut u = Usage::default();
     let roots = [
-        (home.join(".claude/projects"), H::Claude),
-        (home.join(".codex/sessions"), H::Codex),
-        (home.join(".codex/archived_sessions"), H::Codex),
-        (home.join(".pi/agent/sessions"), H::Pi),
+        (home.join(".claude/projects"), Harness::Claude),
+        (home.join(".codex/sessions"), Harness::Codex),
+        (home.join(".codex/archived_sessions"), Harness::Codex),
+        (home.join(".pi/agent/sessions"), Harness::Pi),
     ];
     for (root, harness) in roots {
         let mut files = Vec::new();
         crate::walk_jsonl(&root, &mut files);
         for f in files {
-            let Ok(s) = std::fs::read_to_string(&f) else { continue };
-            count_skill_reads(&s, &mut u.skill_reads);
-            match harness {
-                H::Claude => {
-                    u.claude_sessions += 1;
-                    count_captures(&s, "\"name\":\"Skill\",\"input\":{\"skill\":\"", |c| c == '"', &mut u.skills);
-                    count_captures(&s, "<command-name>/", |c| !(c.is_ascii_alphanumeric() || "-_:".contains(c)), &mut u.commands);
-                    count_mcp(&s, &mut u.mcp_claude);
-                    count_hooks(&s, &mut u.hooks);
-                }
-                H::Codex => {
-                    u.codex_sessions += 1;
-                    count_mcp(&s, &mut u.mcp_codex);
-                }
-                H::Pi => u.pi_sessions += 1,
-            }
+            let Ok(s) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            count_transcript(&s, harness, &mut u);
         }
     }
     u
 }
 
-fn count_captures(hay: &str, pat: &str, stop: impl Fn(char) -> bool, map: &mut HashMap<String, usize>) {
+fn count_transcript(hay: &str, harness: Harness, usage: &mut Usage) {
+    match harness {
+        Harness::Claude => {
+            usage.claude_sessions += 1;
+            count_skill_reads(hay, &mut usage.skill_reads_claude);
+            count_captures(
+                hay,
+                "\"name\":\"Skill\",\"input\":{\"skill\":\"",
+                |c| c == '"',
+                &mut usage.skills,
+            );
+            count_captures(
+                hay,
+                "<command-name>/",
+                |c| !(c.is_ascii_alphanumeric() || "-_:".contains(c)),
+                &mut usage.commands,
+            );
+            count_mcp(hay, &mut usage.mcp_claude);
+            count_hooks(hay, &mut usage.hooks);
+        }
+        Harness::Codex => {
+            usage.codex_sessions += 1;
+            count_skill_reads(hay, &mut usage.skill_reads_codex);
+            count_mcp(hay, &mut usage.mcp_codex);
+        }
+        Harness::Pi => {
+            usage.pi_sessions += 1;
+            count_skill_reads(hay, &mut usage.skill_reads_pi);
+        }
+    }
+}
+
+fn count_captures(
+    hay: &str,
+    pat: &str,
+    stop: impl Fn(char) -> bool,
+    map: &mut HashMap<String, usize>,
+) {
     for (i, _) in hay.match_indices(pat) {
         let rest = &hay[i + pat.len()..];
         let end = rest.find(&stop).unwrap_or(rest.len());
@@ -126,13 +156,19 @@ fn count_captures(hay: &str, pat: &str, stop: impl Fn(char) -> bool, map: &mut H
 }
 
 fn count_mcp(hay: &str, map: &mut HashMap<String, usize>) {
-    let pat = "\"name\":\"mcp__";
+    for pat in ["\"name\":\"mcp__", "tools.mcp__"] {
+        count_mcp_pattern(hay, pat, map);
+    }
+}
+
+fn count_mcp_pattern(hay: &str, pat: &str, map: &mut HashMap<String, usize>) {
     for (i, _) in hay.match_indices(pat) {
         let rest = &hay[i + pat.len()..];
-        if let Some(end) = rest.find("__") {
-            if end > 0 && end < 64 {
-                *map.entry(rest[..end].to_string()).or_default() += 1;
-            }
+        if let Some(end) = rest.find("__")
+            && end > 0
+            && end < 64
+        {
+            *map.entry(rest[..end].to_string()).or_default() += 1;
         }
     }
 }
@@ -143,22 +179,29 @@ fn count_hooks(hay: &str, map: &mut HashMap<String, HookStat>) {
         let rest = &hay[i + pat.len()..];
         let Some(nend) = rest.find('"') else { continue };
         let name = rest[..nend].to_string();
-        let window = &rest[nend..rest.len().min(nend + 300)];
-        let bytes = window
+        let mut window_end = rest.len().min(nend + 300);
+        while !rest.is_char_boundary(window_end) {
+            window_end -= 1;
+        }
+        let window = &rest[nend..window_end];
+        let tokens = window
             .find("\"content\":\"")
             .map(|ci| {
                 let body_start = nend + ci + 11;
                 let len = escaped_len(&rest[body_start..]);
+                let raw = &rest[body_start..body_start + len];
+                let decoded = serde_json::from_str::<String>(&format!("\"{raw}\""))
+                    .unwrap_or_else(|_| raw.to_string());
                 let e = map.entry(name.clone()).or_default();
                 if e.sample.is_empty() {
-                    e.sample = rest[body_start..body_start + len.min(2000)].to_string();
+                    e.sample = crate::clip(&decoded, 2_000);
                 }
-                len
+                crate::estimate_tokens(&decoded)
             })
             .unwrap_or(0);
         let e = map.entry(name).or_default();
         e.fires += 1;
-        e.bytes += bytes;
+        e.tokens += tokens;
     }
 }
 
@@ -172,7 +215,9 @@ fn count_skill_reads(hay: &str, map: &mut HashMap<String, usize>) {
             start += 1;
         }
         let back = &hay[start..i];
-        let is_read = ["path\\\":", "path\":\"", "sed ", "cat ", "head "].iter().any(|m| back.contains(m));
+        let is_read = ["path\\\":", "path\":\"", "sed ", "cat ", "head "]
+            .iter()
+            .any(|m| back.contains(m));
         if !is_read {
             continue;
         }
@@ -180,7 +225,9 @@ fn count_skill_reads(hay: &str, map: &mut HashMap<String, usize>) {
             let name = &back[j + 7..];
             if !name.is_empty()
                 && name.len() < 64
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             {
                 *map.entry(name.to_string()).or_default() += 1;
             }
@@ -204,12 +251,18 @@ fn escaped_len(s: &str) -> usize {
 
 /// Server names differ across harnesses only in separators (chrome-devtools vs chrome_devtools).
 fn canon(s: &str) -> String {
-    s.chars().filter(|c| !"-_".contains(*c)).collect::<String>().to_lowercase()
+    s.chars()
+        .filter(|c| !"-_".contains(*c))
+        .collect::<String>()
+        .to_lowercase()
 }
 
 fn uses_of(map: &HashMap<String, usize>, name: &str) -> usize {
     let c = canon(name);
-    map.iter().filter(|(k, _)| canon(k) == c).map(|(_, v)| v).sum()
+    map.iter()
+        .filter(|(k, _)| canon(k) == c)
+        .map(|(_, v)| v)
+        .sum()
 }
 
 // ---------- inventory + rules ----------
@@ -234,7 +287,7 @@ pub(crate) fn audit() -> EstateReport {
             let uses = usage.skills.get(&name).copied().unwrap_or(0)
                 + usage.commands.get(&name).copied().unwrap_or(0);
             if uses == 0 && age_days(now, md.modified().ok()) > GRACE_DAYS {
-                let reads = usage.skill_reads.get(&name).copied().unwrap_or(0);
+                let reads = usage.skill_reads_claude.get(&name).copied().unwrap_or(0);
                 let reads_note = if reads > 0 {
                     format!(" ({reads} raw file reads observed — hooks or manual)")
                 } else {
@@ -270,10 +323,28 @@ pub(crate) fn audit() -> EstateReport {
         if f.to_string_lossy().contains("staging") {
             continue;
         }
-        push_harness_skill(&f, "codex", usage.codex_sessions, &usage.skill_reads, &mut seen, &mut units, &mut findings, now);
+        push_harness_skill(
+            &f,
+            "codex",
+            usage.codex_sessions,
+            &usage.skill_reads_codex,
+            &mut seen,
+            &mut units,
+            &mut findings,
+            now,
+        );
     }
     for f in pi_skill_files(&home.join(".pi/agent/npm")) {
-        push_harness_skill(&f, "pi", usage.pi_sessions, &usage.skill_reads, &mut seen, &mut units, &mut findings, now);
+        push_harness_skill(
+            &f,
+            "pi",
+            usage.pi_sessions,
+            &usage.skill_reads_pi,
+            &mut seen,
+            &mut units,
+            &mut findings,
+            now,
+        );
     }
 
     // Claude commands: ~/.claude/commands/*.md
@@ -284,7 +355,11 @@ pub(crate) fn audit() -> EstateReport {
                 continue;
             }
             let Ok(md) = p.metadata() else { continue };
-            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            let name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
             units += 1;
             if usage.commands.get(&name).copied().unwrap_or(0) == 0
                 && age_days(now, md.modified().ok()) > GRACE_DAYS
@@ -294,7 +369,9 @@ pub(crate) fn audit() -> EstateReport {
                     unit: format!("command /{name}"),
                     path: p.display().to_string(),
                     fix: format!("confirm with the user, then `rm {}`", p.display()),
-                    tokens: crate::estimate_tokens(&std::fs::read_to_string(&p).unwrap_or_default()),
+                    tokens: crate::estimate_tokens(
+                        &std::fs::read_to_string(&p).unwrap_or_default(),
+                    ),
                     uses: 0,
                     detail: format!(
                         "never invoked across {} claude sessions{}",
@@ -309,24 +386,24 @@ pub(crate) fn audit() -> EstateReport {
 
     // MCP servers: ~/.claude.json (global + per-project) and ~/.codex/config.toml
     let mut servers: Vec<(String, &'static str, String)> = Vec::new(); // name, harness, scope
-    if let Ok(s) = std::fs::read_to_string(home.join(".claude.json")) {
-        if let Ok(v) = serde_json::from_str::<Value>(&s) {
-            if let Some(m) = v["mcpServers"].as_object() {
-                for k in m.keys() {
-                    servers.push((k.clone(), "claude", "global".into()));
-                }
+    if let Ok(s) = std::fs::read_to_string(home.join(".claude.json"))
+        && let Ok(v) = serde_json::from_str::<Value>(&s)
+    {
+        if let Some(m) = v["mcpServers"].as_object() {
+            for k in m.keys() {
+                servers.push((k.clone(), "claude", "global".into()));
             }
-            if let Some(projs) = v["projects"].as_object() {
-                for (proj, pv) in projs {
-                    if let Some(m) = pv["mcpServers"].as_object() {
-                        for k in m.keys() {
-                            if !servers.iter().any(|(n, h, _)| n == k && *h == "claude") {
-                                servers.push((
-                                    k.clone(),
-                                    "claude",
-                                    format!("project {}", proj.rsplit('/').next().unwrap_or(proj)),
-                                ));
-                            }
+        }
+        if let Some(projs) = v["projects"].as_object() {
+            for (proj, pv) in projs {
+                if let Some(m) = pv["mcpServers"].as_object() {
+                    for k in m.keys() {
+                        if !servers.iter().any(|(n, h, _)| n == k && *h == "claude") {
+                            servers.push((
+                                k.clone(),
+                                "claude",
+                                format!("project {}", proj.rsplit('/').next().unwrap_or(proj)),
+                            ));
                         }
                     }
                 }
@@ -346,9 +423,19 @@ pub(crate) fn audit() -> EstateReport {
     for (name, harness, scope) in &servers {
         units += 1;
         let (own, other, other_label, sessions) = if *harness == "claude" {
-            (&usage.mcp_claude, &usage.mcp_codex, "codex", usage.claude_sessions)
+            (
+                &usage.mcp_claude,
+                &usage.mcp_codex,
+                "codex",
+                usage.claude_sessions,
+            )
         } else {
-            (&usage.mcp_codex, &usage.mcp_claude, "claude", usage.codex_sessions)
+            (
+                &usage.mcp_codex,
+                &usage.mcp_claude,
+                "claude",
+                usage.codex_sessions,
+            )
         };
         if uses_of(own, name) == 0 {
             let cross = uses_of(other, name);
@@ -357,11 +444,19 @@ pub(crate) fn audit() -> EstateReport {
             } else {
                 String::new()
             };
-            let config = if *harness == "claude" { ".claude.json" } else { ".codex/config.toml" };
-            let fix = if *harness == "claude" {
-                format!("run `claude mcp remove {name}` (or delete the \"{name}\" entry under mcpServers in ~/.claude.json)")
+            let config = if *harness == "claude" {
+                ".claude.json"
             } else {
-                format!("delete the `[mcp_servers.{name}]` block (and any `[mcp_servers.{name}.*]` sub-tables) from ~/.codex/config.toml")
+                ".codex/config.toml"
+            };
+            let fix = if *harness == "claude" {
+                format!(
+                    "run `claude mcp remove {name}` (or delete the \"{name}\" entry under mcpServers in ~/.claude.json)"
+                )
+            } else {
+                format!(
+                    "delete the `[mcp_servers.{name}]` block (and any `[mcp_servers.{name}.*]` sub-tables) from ~/.codex/config.toml"
+                )
             };
             findings.push(EstateFinding {
                 rule: "dead-mcp",
@@ -393,7 +488,11 @@ pub(crate) fn audit() -> EstateReport {
             if let Ok(files) = std::fs::read_dir(&mem) {
                 for f in files.flatten() {
                     let p = f.path();
-                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let fname = p
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
                     if p.extension().is_none_or(|x| x != "md") || fname == "MEMORY.md" {
                         continue;
                     }
@@ -413,7 +512,7 @@ pub(crate) fn audit() -> EstateReport {
                         findings.push(EstateFinding {
                             rule: "orphan-memory",
                             unit: format!("memory {project}/{fname}"),
-                            path: p.display().to_string(),
+                            path: mem.join("MEMORY.md").display().to_string(),
                             fix: format!(
                                 "append to {}: `- [{}]({fname}) — {desc}`",
                                 mem.join("MEMORY.md").display(),
@@ -421,7 +520,8 @@ pub(crate) fn audit() -> EstateReport {
                             ),
                             tokens: crate::estimate_tokens(&body),
                             uses: 0,
-                            detail: "on disk but missing from MEMORY.md index — never loaded".into(),
+                            detail: "on disk but missing from MEMORY.md index — never loaded"
+                                .into(),
                             action: "repair index",
                         });
                     }
@@ -549,18 +649,21 @@ pub(crate) fn audit() -> EstateReport {
                     ),
                     tokens: b.tokens,
                     uses: 0,
-                    detail: format!("~{} tok paid on every request of every session", tok_fmt(b.tokens)),
+                    detail: format!(
+                        "~{} tok paid on every request of every session",
+                        tok_fmt(b.tokens)
+                    ),
                     action: "tighten",
                 });
             }
             blocks.push(b);
         }
     }
-    blocks.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+    blocks.sort_by_key(|block| Reverse(block.tokens));
 
     // hook tax: payloads observed injected into transcripts
     for (name, stat) in &usage.hooks {
-        let tokens = stat.bytes / 4;
+        let tokens = stat.tokens / stat.fires.max(1);
         if tokens > HOOK_TAX_MIN_TOKENS {
             findings.push(EstateFinding {
                 rule: "hook-tax",
@@ -568,13 +671,13 @@ pub(crate) fn audit() -> EstateReport {
                 path: home.join(".claude/settings.json").display().to_string(),
                 fix: format!(
                     "with the user, decide if the `{name}` payload earns ~{} tok per session; if not, slim the injected text or narrow the hook matcher in ~/.claude/settings.json",
-                    tok_fmt(tokens / stat.fires.max(1))
+                    tok_fmt(tokens)
                 ),
                 tokens,
                 uses: stat.fires,
                 detail: format!(
                     "injects ~{} tok per firing, {} firings observed",
-                    tok_fmt(tokens / stat.fires.max(1)),
+                    tok_fmt(tokens),
                     stat.fires
                 ),
                 action: "review necessity",
@@ -582,7 +685,11 @@ pub(crate) fn audit() -> EstateReport {
         }
     }
 
-    findings.sort_by(|a, b| rank(a.rule).cmp(&rank(b.rule)).then(b.tokens.cmp(&a.tokens)));
+    findings.sort_by(|a, b| {
+        rank(a.rule)
+            .cmp(&rank(b.rule))
+            .then(b.tokens.cmp(&a.tokens))
+    });
 
     let mut used: Vec<String> = Vec::new();
     let mut push_usage = |kind: &str, map: &HashMap<String, usize>| {
@@ -593,7 +700,9 @@ pub(crate) fn audit() -> EstateReport {
         }
     };
     push_usage("skill", &usage.skills);
-    push_usage("skill-read", &usage.skill_reads);
+    push_usage("skill-read(claude)", &usage.skill_reads_claude);
+    push_usage("skill-read(codex)", &usage.skill_reads_codex);
+    push_usage("skill-read(pi)", &usage.skill_reads_pi);
     push_usage("command", &usage.commands);
     push_usage("mcp(claude)", &usage.mcp_claude);
     push_usage("mcp(codex)", &usage.mcp_codex);
@@ -620,7 +729,11 @@ pub(crate) fn audit() -> EstateReport {
         usage: used,
         semantic: None,
     };
-    report.usage.extend(hook_samples.into_iter().map(|(n, s)| format!("hook-sample {n}: {s}")));
+    report.usage.extend(
+        hook_samples
+            .into_iter()
+            .map(|(n, s)| format!("hook-sample {n}: {s}")),
+    );
     report
 }
 
@@ -646,9 +759,12 @@ fn push_harness_skill(
     }
     let Ok(md) = skill_md.metadata() else { return };
     *units += 1;
-    if reads.get(&name).copied().unwrap_or(0) == 0 && age_days(now, md.modified().ok()) > GRACE_DAYS {
+    if reads.get(&name).copied().unwrap_or(0) == 0 && age_days(now, md.modified().ok()) > GRACE_DAYS
+    {
         let fix = if harness == "codex" {
-            format!("disable or uninstall the Codex plugin providing `{name}` (deleting from the plugin cache gets re-synced)")
+            format!(
+                "disable or uninstall the Codex plugin providing `{name}` (deleting from the plugin cache gets re-synced)"
+            )
         } else {
             format!("remove the pi package providing `{name}` from ~/.pi/agent/npm")
         };
@@ -731,15 +847,24 @@ fn git_stats(path: &Path) -> Option<(u64, usize)> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let commits: Vec<u64> = stdout.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    let commits: Vec<u64> = stdout
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
     let last = *commits.first()?;
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
     Some((now.saturating_sub(last) / 86_400, commits.len()))
 }
 
 fn git_note(path: &Path) -> String {
     match git_stats(path) {
-        Some((age, commits)) => format!("; git: {commits} commit{}, last change {age}d ago", if commits == 1 { "" } else { "s" }),
+        Some((age, commits)) => format!(
+            "; git: {commits} commit{}, last change {age}d ago",
+            if commits == 1 { "" } else { "s" }
+        ),
         None => String::new(),
     }
 }
@@ -798,14 +923,26 @@ fn index_links(text: &str) -> Vec<String> {
 /// Restricted to real filesystem roots so API endpoints like /rest/e2e/reset
 /// or /runs/{id} don't false-positive.
 fn missing_paths(body: &str) -> Vec<String> {
-    const FS_ROOTS: [&str; 7] = ["/Users/", "/tmp/", "/private/", "/var/", "/etc/", "/opt/", "/home/"];
+    const FS_ROOTS: [&str; 7] = [
+        "/Users/",
+        "/tmp/",
+        "/private/",
+        "/var/",
+        "/etc/",
+        "/opt/",
+        "/home/",
+    ];
     let home = std::env::var("HOME").unwrap_or_default();
     let mut out: Vec<String> = Vec::new();
     for tok in body.split_whitespace() {
         let t = tok
             .trim_matches(|c: char| "()[]`'\",;:*.".contains(c))
             .trim_end_matches('/');
-        let expanded = if let Some(rest) = t.strip_prefix("~/") { format!("{home}/{rest}") } else { t.to_string() };
+        let expanded = if let Some(rest) = t.strip_prefix("~/") {
+            format!("{home}/{rest}")
+        } else {
+            t.to_string()
+        };
         if FS_ROOTS.iter().any(|r| expanded.starts_with(r))
             && expanded.matches('/').count() >= 2
             && !expanded.contains(['$', '*', '{', '}', '<', '>'])
@@ -825,7 +962,10 @@ pub(crate) fn semantic_pass(report: &EstateReport) -> Result<Semantic> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let mut digest = String::new();
     for (label, path) in [
-        ("CLAUDE.md (global instructions)", home.join(".claude/CLAUDE.md")),
+        (
+            "CLAUDE.md (global instructions)",
+            home.join(".claude/CLAUDE.md"),
+        ),
         ("codex AGENTS.md", home.join(".codex/AGENTS.md")),
     ] {
         if let Ok(s) = std::fs::read_to_string(path) {
@@ -847,15 +987,15 @@ pub(crate) fn semantic_pass(report: &EstateReport) -> Result<Semantic> {
         for e in rd.flatten() {
             if let Ok(files) = std::fs::read_dir(e.path().join("memory")) {
                 for f in files.flatten() {
-                    if f.path().extension().is_some_and(|x| x == "md") {
-                        if let Ok(s) = std::fs::read_to_string(f.path()) {
-                            digest.push_str(&format!(
-                                "\n--- memory {}/{} ---\n{}\n",
-                                crate::decode_slug(&e.file_name().to_string_lossy()),
-                                f.file_name().to_string_lossy(),
-                                crate::clip(&s, 800)
-                            ));
-                        }
+                    if f.path().extension().is_some_and(|x| x == "md")
+                        && let Ok(s) = std::fs::read_to_string(f.path())
+                    {
+                        digest.push_str(&format!(
+                            "\n--- memory {}/{} ---\n{}\n",
+                            crate::decode_slug(&e.file_name().to_string_lossy()),
+                            f.file_name().to_string_lossy(),
+                            crate::clip(&s, 800)
+                        ));
                     }
                 }
             }
@@ -880,7 +1020,11 @@ pub(crate) fn semantic_pass(report: &EstateReport) -> Result<Semantic> {
 // ---------- output ----------
 
 pub(crate) fn tok_or_unknown(tokens: usize) -> String {
-    if tokens == 0 { "?".into() } else { format!("~{}", tok_fmt(tokens)) }
+    if tokens == 0 {
+        "?".into()
+    } else {
+        format!("~{}", tok_fmt(tokens))
+    }
 }
 
 pub(crate) fn human(r: &EstateReport) {
@@ -911,8 +1055,14 @@ pub(crate) fn human(r: &EstateReport) {
     }
     if let Some(sem) = &r.semantic {
         println!("  semantic ({}):", sem.model_used);
-        println!("    contradictions:\n      {}", sem.contradiction.replace('\n', "\n      "));
-        println!("    duplication:\n      {}", sem.bloating.replace('\n', "\n      "));
+        println!(
+            "    contradictions:\n      {}",
+            sem.contradiction.replace('\n', "\n      ")
+        );
+        println!(
+            "    duplication:\n      {}",
+            sem.bloating.replace('\n', "\n      ")
+        );
     }
 }
 
@@ -954,10 +1104,18 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
             continue;
         }
         let saved: usize = group.iter().map(|f| f.tokens).sum();
-        let saved_note = if saved > 0 { format!(" — ~{} tok", tok_fmt(saved)) } else { String::new() };
+        let saved_note = if saved > 0 {
+            format!(" — ~{} tok", tok_fmt(saved))
+        } else {
+            String::new()
+        };
         md.push_str(&format!("### {heading} ({}{saved_note})\n\n", group.len()));
         for f in group {
-            let tok_note = if f.tokens > 0 { format!(" [~{} tok]", tok_fmt(f.tokens)) } else { String::new() };
+            let tok_note = if f.tokens > 0 {
+                format!(" [~{} tok]", tok_fmt(f.tokens))
+            } else {
+                String::new()
+            };
             md.push_str(&format!(
                 "- [ ] **{}**{tok_note} — {}\n      - why: {}\n      - file: `{}`\n",
                 f.unit, f.fix, f.detail, f.path
@@ -968,7 +1126,12 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
     if !r.blocks.is_empty() {
         md.push_str("## Always-loaded instruction blocks (priced per heading)\n\n| file | block | tokens |\n|---|---|---|\n");
         for b in &r.blocks {
-            md.push_str(&format!("| {} | {} | ~{} |\n", b.file, b.heading, tok_fmt(b.tokens)));
+            md.push_str(&format!(
+                "| {} | {} | ~{} |\n",
+                b.file,
+                b.heading,
+                tok_fmt(b.tokens)
+            ));
         }
         md.push('\n');
     }
@@ -988,7 +1151,7 @@ pub(crate) fn estate_cmd(json: bool, want_semantic: bool, output: Option<String>
         r.semantic = Some(semantic_pass(&r).unwrap_or_else(|e| Semantic {
             contradiction: format!("semantic unavailable: {e}"),
             bloating: String::new(),
-            model_used: crate::SEMANTIC_MODEL.into(),
+            model_used: crate::semantic_model(),
         }));
     }
     if let Some(out) = output {
@@ -1008,15 +1171,26 @@ mod tests {
 
     #[test]
     fn captures_skill_command_and_mcp_usage() {
-        let line = r#"{"x":[{"name":"Skill","input":{"skill":"graphify"}},{"name":"mcp__chrome-devtools__click"}]} <command-name>/effort"#;
+        let line = r#"{"x":[{"name":"Skill","input":{"skill":"graphify"}},{"name":"mcp__chrome-devtools__click"}]} <command-name>/effort await tools.mcp__chrome_devtools__click({})"#;
         let mut skills = HashMap::new();
         let mut mcp = HashMap::new();
         let mut cmds = HashMap::new();
-        count_captures(line, "\"name\":\"Skill\",\"input\":{\"skill\":\"", |c| c == '"', &mut skills);
-        count_captures(line, "<command-name>/", |c| !(c.is_ascii_alphanumeric() || "-_:".contains(c)), &mut cmds);
+        count_captures(
+            line,
+            "\"name\":\"Skill\",\"input\":{\"skill\":\"",
+            |c| c == '"',
+            &mut skills,
+        );
+        count_captures(
+            line,
+            "<command-name>/",
+            |c| !(c.is_ascii_alphanumeric() || "-_:".contains(c)),
+            &mut cmds,
+        );
         count_mcp(line, &mut mcp);
         assert_eq!(skills.get("graphify"), Some(&1));
         assert_eq!(mcp.get("chrome-devtools"), Some(&1));
+        assert_eq!(mcp.get("chrome_devtools"), Some(&1));
         assert_eq!(cmds.get("effort"), Some(&1));
     }
 
@@ -1036,13 +1210,17 @@ mod tests {
         assert_eq!(reads.get("gh-address-comments"), Some(&1));
         // pi/claude read tool style counts too
         let mut reads2 = HashMap::new();
-        count_skill_reads(r#"{"arguments":{"path":"/Users/x/.claude/skills/graphify/SKILL.md"}}"#, &mut reads2);
+        count_skill_reads(
+            r#"{"arguments":{"path":"/Users/x/.claude/skills/graphify/SKILL.md"}}"#,
+            &mut reads2,
+        );
         assert_eq!(reads2.get("graphify"), Some(&1));
     }
 
     #[test]
     fn prose_skill_mention_is_not_usage() {
-        let line = "- **graphify** (`~/.claude/skills/graphify/SKILL.md`) - any input to knowledge graph";
+        let line =
+            "- **graphify** (`~/.claude/skills/graphify/SKILL.md`) - any input to knowledge graph";
         let mut reads = HashMap::new();
         count_skill_reads(line, &mut reads);
         assert!(reads.is_empty());
@@ -1061,14 +1239,40 @@ mod tests {
         count_hooks(line, &mut hooks);
         let stat = &hooks["SessionStart:startup"];
         assert_eq!(stat.fires, 1);
-        assert!(stat.bytes > 15);
+        assert!(stat.tokens > 0);
         assert!(stat.sample.contains("mullet"));
+    }
+
+    #[test]
+    fn unicode_hook_payload_does_not_panic() {
+        let payload = "é".repeat(2_000);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        let line = format!(
+            "{{\"type\":\"hook_success\",\"hookName\":\"SessionStart:unicode\",\"content\":{encoded}}}"
+        );
+        let mut hooks = HashMap::new();
+        count_hooks(&line, &mut hooks);
+        assert_eq!(hooks["SessionStart:unicode"].fires, 1);
+        assert!(!hooks["SessionStart:unicode"].sample.is_empty());
+    }
+
+    #[test]
+    fn skill_reads_stay_in_their_harness() {
+        let line = r#"await tools.exec_command({cmd:"sed -n '1,220p' /x/skills/shared/SKILL.md"})"#;
+        let mut usage = Usage::default();
+        count_transcript(line, Harness::Codex, &mut usage);
+        assert_eq!(usage.skill_reads_codex.get("shared"), Some(&1));
+        assert!(usage.skill_reads_pi.is_empty());
+        assert!(usage.skill_reads_claude.is_empty());
     }
 
     #[test]
     fn index_link_extraction() {
         let idx = "# Notes\n- [A](a.md) — hook\n- [B](b.md)\n- [ext](https://x.com/y.md)\n";
-        assert_eq!(index_links(idx), vec!["a.md".to_string(), "b.md".to_string()]);
+        assert_eq!(
+            index_links(idx),
+            vec!["a.md".to_string(), "b.md".to_string()]
+        );
     }
 
     #[test]
@@ -1083,8 +1287,12 @@ mod tests {
     #[test]
     fn git_stats_on_tracked_file() {
         // this repo's own Cargo.toml is committed, so stats must resolve
-        let (age, commits) = git_stats(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml").as_path())
-            .expect("tracked file");
+        let (age, commits) = git_stats(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("Cargo.toml")
+                .as_path(),
+        )
+        .expect("tracked file");
         assert!(commits >= 1);
         assert!(age < 36_500);
         assert!(git_stats(Path::new("/tmp/definitely-not-in-git.xyz")).is_none());
@@ -1092,7 +1300,8 @@ mod tests {
 
     #[test]
     fn missing_path_detection() {
-        let body = "See /tmp/definitely-not-real/xyz.rs and /rest/e2e/reset and /runs/{id} and /tmp";
+        let body =
+            "See /tmp/definitely-not-real/xyz.rs and /rest/e2e/reset and /runs/{id} and /tmp";
         let missing = missing_paths(body);
         assert_eq!(missing, vec!["/tmp/definitely-not-real/xyz.rs".to_string()]);
     }
