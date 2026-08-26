@@ -81,6 +81,7 @@ pub(crate) enum Source {
     Pi,
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl Source {
@@ -89,6 +90,7 @@ impl Source {
             Source::Pi => "pi",
             Source::Claude => "claude",
             Source::Codex => "codex",
+            Source::OpenCode => "opencode",
         }
     }
 }
@@ -140,8 +142,110 @@ pub(crate) fn sessions() -> Vec<SessionMeta> {
             out.push(SessionMeta { source, path, title, modified, size, preview: None });
         }
     }
+    opencode_sessions(&mut out);
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
     out
+}
+
+// ---------- opencode (sqlite-backed sessions, addressed as "opencode:<id>") ----------
+
+fn opencode_db() -> PathBuf {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    home.join(".local/share/opencode/opencode.db")
+}
+
+fn sqlite_json(db: &Path, query: &str) -> Vec<Value> {
+    let Ok(out) = std::process::Command::new("sqlite3")
+        .arg("-readonly")
+        .arg("-json")
+        .arg(db)
+        .arg(query)
+        .output()
+    else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<Value>>(&out.stdout).unwrap_or_default()
+}
+
+fn opencode_sessions(out: &mut Vec<SessionMeta>) {
+    let db = opencode_db();
+    if !db.is_file() {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let rows = sqlite_json(
+        &db,
+        "select s.id as id, s.directory as dir, s.title as title, s.time_updated as up, \
+         coalesce(sum(length(p.data)),0) as bytes \
+         from session s left join part p on p.session_id = s.id group by s.id",
+    );
+    for r in rows {
+        let Some(id) = r["id"].as_str() else { continue };
+        let dir = r["dir"].as_str().unwrap_or("?");
+        let title = dir.strip_prefix(&home).unwrap_or(dir).trim_start_matches('/').to_string();
+        out.push(SessionMeta {
+            source: Source::OpenCode,
+            path: PathBuf::from(format!("opencode:{id}")),
+            title: if title.is_empty() { "~".into() } else { title },
+            modified: SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_millis(r["up"].as_u64().unwrap_or(0)),
+            size: r["bytes"].as_u64().unwrap_or(0),
+            // the db already stores an LLM-generated session title — use it as the preview
+            preview: Some(r["title"].as_str().unwrap_or("").to_string()),
+        });
+    }
+}
+
+fn parse_opencode(id: &str) -> Result<Vec<Event>> {
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!("invalid opencode session id");
+    }
+    let rows = sqlite_json(
+        &opencode_db(),
+        &format!(
+            "select m.id as mid, json_extract(m.data,'$.role') as role, p.data as data \
+             from part p join message m on m.id = p.message_id \
+             where p.session_id = '{id}' order by m.time_created, m.id, p.id"
+        ),
+    );
+    if rows.is_empty() {
+        anyhow::bail!("no opencode session {id} (or sqlite3 unavailable)");
+    }
+    let mut events: Vec<Event> = Vec::new();
+    for r in &rows {
+        let mid = r["mid"].as_str().unwrap_or("");
+        let role = r["role"].as_str().unwrap_or("unknown");
+        let part: Value = r["data"].as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+        let items = opencode_items(&part);
+        if items.is_empty() {
+            continue;
+        }
+        match events.last_mut() {
+            Some(ev) if ev.id == mid => ev.items.extend(items),
+            _ => events.push(Event { id: mid.to_string(), role: role.to_string(), items }),
+        }
+    }
+    Ok(events)
+}
+
+/// An opencode `tool` part carries the call and its result merged in one object.
+fn opencode_items(part: &Value) -> Vec<Item> {
+    match part["type"].as_str().unwrap_or("") {
+        "text" => vec![Item::Text(part["text"].as_str().unwrap_or("").into())],
+        "reasoning" => vec![Item::Thinking(part["text"].as_str().unwrap_or("").into())],
+        "tool" => {
+            let call_id = part["callID"].as_str().unwrap_or("").to_string();
+            let name = part["tool"].as_str().unwrap_or("");
+            vec![
+                tool_call_item(call_id.clone(), name, &part["state"]["input"]),
+                Item::ToolResult {
+                    call_id,
+                    tokens: estimate_tokens(part["state"]["output"].as_str().unwrap_or("")),
+                },
+            ]
+        }
+        _ => vec![],
+    }
 }
 
 fn title_for(source: Source, path: &Path) -> String {
@@ -149,6 +253,8 @@ fn title_for(source: Source, path: &Path) -> String {
     match source {
         // dir name encodes the cwd, e.g. "--Users-me-dev-cxwatch--" / "-Users-me-dev-cxwatch"
         Source::Pi | Source::Claude => decode_slug(parent),
+        // listed straight from the db, never via file walk
+        Source::OpenCode => String::new(),
         // filename: rollout-<date>T<time>-<uuid>.jsonl
         Source::Codex => {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
@@ -196,6 +302,8 @@ pub(crate) fn preview(source: Source, path: &Path) -> String {
                 && v["payload"]["role"] == "user")
                 .then(|| first_text(&v["payload"]["content"]))
                 .flatten(),
+            // preview comes from the db title, set at listing time
+            Source::OpenCode => return String::new(),
         };
         if let Some(t) = text {
             let t = t.trim();
@@ -245,6 +353,9 @@ pub(crate) struct Event {
 }
 
 pub(crate) fn parse(path: &Path) -> Result<Vec<Event>> {
+    if let Some(id) = path.to_str().and_then(|s| s.strip_prefix("opencode:")) {
+        return parse_opencode(id);
+    }
     let s = std::fs::read_to_string(path)?;
     Ok(s.lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -379,7 +490,7 @@ fn tool_call_item(call_id: String, name: &str, args: &Value) -> Item {
 
 fn tool_targets(name: &str, args: &Value) -> Vec<(Action, String)> {
     let file = || {
-        ["path", "file_path", "notebook_path"]
+        ["path", "file_path", "filePath", "notebook_path"]
             .iter()
             .find_map(|k| args[*k].as_str())
             .map(String::from)
@@ -446,8 +557,13 @@ fn patch_targets(patch: &str) -> Vec<(Action, String)> {
         .collect()
 }
 
+/// Real BPE token count (o200k). Falls back to len/4 only if the tokenizer fails to load.
 pub(crate) fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4
+    static BPE: std::sync::OnceLock<Option<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
+    match BPE.get_or_init(|| tiktoken_rs::o200k_base().ok()) {
+        Some(bpe) => bpe.encode_ordinary(text).len(),
+        None => text.len() / 4,
+    }
 }
 
 fn text_of(content: &Value) -> String {
@@ -863,16 +979,17 @@ mod tests {
 
     #[test]
     fn stale_read_flags_the_earlier_read() {
+        let payload = "some file content that was read ".repeat(20);
         let events = vec![
             pi_call("a", "c1", "read", json!({"path":"/x"})),
-            pi_result("c1", &"y".repeat(400)),
+            pi_result("c1", &payload),
             pi_call("b", "c2", "edit", json!({"path":"/x"})),
         ];
         let f = analyze(&events);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule, "stale-read");
         assert_eq!(f[0].event_idx, 0);
-        assert_eq!(f[0].tokens, 100); // from the tool result, not the call
+        assert_eq!(f[0].tokens, estimate_tokens(&payload)); // priced from the tool result, not the call
     }
 
     #[test]
@@ -886,22 +1003,25 @@ mod tests {
 
     #[test]
     fn superseded_read_flags_the_earlier_copy() {
+        let payload = "line of file content here ".repeat(10);
         let events = vec![
             pi_call("a", "c1", "read", json!({"path":"/f"})),
-            pi_result("c1", &"y".repeat(80)),
+            pi_result("c1", &payload),
             pi_call("b", "c2", "read", json!({"path":"/f"})),
         ];
         let f = analyze(&events);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule, "superseded-read");
         assert_eq!(f[0].event_idx, 0);
-        assert_eq!(f[0].tokens, 20);
+        assert_eq!(f[0].tokens, estimate_tokens(&payload));
     }
 
     #[test]
     fn huge_thinking() {
+        let thinking = "thinking about the problem in detail ".repeat(500);
+        assert!(estimate_tokens(&thinking) > 2000);
         let ev = parse_line(&json!({"type":"message","id":"t","message":{"role":"assistant",
-            "content":[{"type":"thinking","thinking":"x".repeat(8200)}]}}))
+            "content":[{"type":"thinking","thinking":thinking}]}}))
         .unwrap();
         let f = analyze(&[ev]);
         assert_eq!(f.len(), 1);
@@ -910,14 +1030,16 @@ mod tests {
 
     #[test]
     fn huge_output() {
+        let payload = "a long line of interesting command output ".repeat(400);
+        assert!(estimate_tokens(&payload) > 2500);
         let events = vec![
             pi_call("a", "c1", "bash", json!({"command":"ls -la"})),
-            pi_result("c1", &"y".repeat(20_000)),
+            pi_result("c1", &payload),
         ];
         let f = analyze(&events);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule, "huge-output");
-        assert_eq!(f[0].tokens, 5000);
+        assert_eq!(f[0].tokens, estimate_tokens(&payload));
     }
 
     #[test]
@@ -925,8 +1047,9 @@ mod tests {
         let call = parse_line(&json!({"type":"assistant","uuid":"u1","message":{"role":"assistant",
             "content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a.rs"}}]}}))
         .unwrap();
+        let payload = "fn main() { println!(\"hi\"); } ".repeat(15);
         let result = parse_line(&json!({"type":"user","uuid":"u2","message":{"role":"user",
-            "content":[{"type":"tool_result","tool_use_id":"t1","content":"z".repeat(400)}]}}))
+            "content":[{"type":"tool_result","tool_use_id":"t1","content":payload}]}}))
         .unwrap();
         let edit = parse_line(&json!({"type":"assistant","uuid":"u3","message":{"role":"assistant",
             "content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/a.rs"}}]}}))
@@ -934,7 +1057,22 @@ mod tests {
         let f = analyze(&[call, result, edit]);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule, "stale-read");
-        assert_eq!(f[0].tokens, 100);
+        assert_eq!(f[0].tokens, estimate_tokens(&payload));
+    }
+
+    #[test]
+    fn opencode_tool_part_yields_call_and_result() {
+        let part = json!({"type":"tool","tool":"read","callID":"c1",
+            "state":{"status":"completed","input":{"filePath":"/a.rs"},"output":"file contents here"}});
+        let items = opencode_items(&part);
+        assert_eq!(items.len(), 2);
+        let Item::ToolCall { targets, .. } = &items[0] else { panic!("expected call") };
+        assert_eq!(targets, &vec![(Action::Read, "/a.rs".to_string())]);
+        let Item::ToolResult { call_id, tokens } = &items[1] else { panic!("expected result") };
+        assert_eq!(call_id, "c1");
+        assert_eq!(*tokens, estimate_tokens("file contents here"));
+        assert!(matches!(opencode_items(&json!({"type":"reasoning","text":"hmm"}))[0], Item::Thinking(_)));
+        assert!(opencode_items(&json!({"type":"step-start"})).is_empty());
     }
 
     #[test]

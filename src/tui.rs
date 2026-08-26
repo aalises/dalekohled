@@ -497,7 +497,7 @@ fn estate_lines(r: &crate::estate::EstateReport) -> (Vec<Line<'static>>, Vec<Opt
 fn rule_color(rule: &str) -> Color {
     match rule {
         "stale-read" | "dead-skill" | "dead-mcp" => Color::Red,
-        "superseded-read" | "duplicate-directive" | "dead-command" => Color::Yellow,
+        "superseded-read" | "duplicate-directive" | "dead-command" | "heavy-block" => Color::Yellow,
         "huge-thinking" | "orphan-memory" | "dangling-index" | "stale-ref" => Color::Magenta,
         "huge-output" | "hook-tax" | "stale-memory" => Color::Blue,
         _ => Color::White,
@@ -509,5 +509,6 @@ fn source_color(s: Source) -> Color {
         Source::Pi => Color::Magenta,
         Source::Claude => Color::Cyan,
         Source::Codex => Color::Green,
+        Source::OpenCode => Color::Yellow,
     }
 }
