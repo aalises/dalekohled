@@ -47,6 +47,10 @@ Sleep 1.5s
 Enter
 Sleep 3s
 
+# f arms the one-key autofix (a second press would apply it, with backups)
+Type "f"
+Sleep 3s
+
 # export the ledger as shareable markdown
 Type "e"
 Sleep 2.5s
@@ -72,3 +76,9 @@ Type "clear && sed -n '/Always-loaded/,$p' prune-plan.md"
 Sleep 800ms
 Enter
 Sleep 5s
+
+# ── Act 5: the rot-o-meter — live rot % for any harness (statusline/tmux) ──
+Type "clear && cxwatch status ~/.codex/archived_sessions/rollout-2026-05-11T10-08-24*.jsonl && cxwatch status"
+Sleep 800ms
+Enter
+Sleep 6s
