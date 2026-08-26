@@ -18,7 +18,13 @@ Sleep 800ms
 Enter
 Sleep 3.5s
 
-# filter down to one identifiable session (the 66%-rot codex monster)
+# four harnesses — filter to one project: opencode (yellow) rows appear among claude/pi
+Type "dev/n8n"
+Sleep 2.5s
+Escape
+Sleep 800ms
+
+# now down to one identifiable session (the 66%-rot codex monster)
 Type "019e1614"
 Sleep 2.5s
 
@@ -60,4 +66,10 @@ Sleep 7s
 Type "head -n 26 prune-plan.md"
 Sleep 800ms
 Enter
-Sleep 6.5s
+Sleep 6s
+
+# per-block pricing of always-loaded instructions
+Type "clear && sed -n '/Always-loaded/,$p' prune-plan.md"
+Sleep 800ms
+Enter
+Sleep 5s
