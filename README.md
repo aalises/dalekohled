@@ -22,7 +22,8 @@ Two tiers, like a linter:
 
 ## Install
 
-Requires [Rust](https://rustup.rs) (edition 2024). Optional: the `pi` CLI on your PATH for `--semantic` passes.
+Requires [Rust](https://rustup.rs) (edition 2024). Optional: the `pi` CLI on your PATH for `--semantic`
+passes, and the `sqlite3` binary (preinstalled on macOS) for OpenCode sessions.
 
 ```bash
 git clone https://github.com/aalises/dalekohled.git
@@ -95,6 +96,11 @@ every session. `cxwatch estate` joins the declared estate against observed usage
 | `dangling-index` | MEMORY.md entry pointing at a nonexistent file | repair index |
 | `stale-ref` | memory/instructions referencing filesystem paths that no longer exist | update |
 | `stale-memory` | memories unmodified for 120+ days | review |
+| `heavy-block` | a single CLAUDE.md/AGENTS.md heading block over 400 tokens | tighten |
+
+Token counts are real **o200k BPE** counts (not estimates). Instruction files are priced **per heading
+block** (see the blocks table in the fix report / JSON). Units tracked in a git repo get **age/churn
+signals** (`git: N commits, last change Xd ago`) in their finding details.
 
 The TUI estate view is a control panel: a stacked token bar by category, the ledger below, and `enter`
 on any finding reveals its concrete fix.
@@ -118,6 +124,7 @@ claude "work through plan.md"
 | Claude Code | `~/.claude/projects`                       | skills, commands, memory, hooks, `~/.claude.json` MCP |
 | Codex       | `~/.codex/{sessions,archived_sessions}`    | `config.toml` MCP, plugin skills, AGENTS.md     |
 | pi          | `~/.pi/agent/sessions`                     | npm package skills                              |
+| OpenCode    | `~/.local/share/opencode/opencode.db` (sqlite; sessions addressable as `opencode:<id>`) | AGENTS.md |
 
 Usage is mined from each harness's own transcripts; skills newer than 14 days get a grace period.
 Everything is report-only — the human (or their agent, with confirmation) decides what to delete.
@@ -136,6 +143,7 @@ cargo test
 ## Roadmap
 
 1. ~~multi-harness parsers, result-linked token accounting, TUI, estate audit, fix reports~~ ✅
-2. real tokenizer (currently `len/4` estimate), git age/churn signals, per-block CLAUDE.md pricing
+2. ~~real o200k tokenizer, git age/churn signals, per-block instruction pricing, OpenCode support~~ ✅
 3. LLM tier v2: atomic-claim decomposition, content-hash caching, re-run on file change
-4. `cxwatch daemon` — per-session watcher, real-time notifications, pluggable rules
+4. more harnesses (Gemini CLI, Goose, Cline) — added when there's real session data to validate against
+5. `cxwatch daemon` — per-session watcher, real-time notifications, pluggable rules
