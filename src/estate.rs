@@ -1145,8 +1145,225 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
     md
 }
 
-pub(crate) fn estate_cmd(json: bool, want_semantic: bool, output: Option<String>) -> Result<()> {
+// ---------- autofix ----------
+
+#[derive(Serialize, Clone, PartialEq, Debug)]
+#[serde(tag = "kind")]
+pub(crate) enum FixOp {
+    AppendLine { file: String, line: String },
+    DeleteMatchingLine { file: String, contains: String },
+    Trash { path: String },
+    Command { argv: Vec<String> },
+    DeleteTomlTable { file: String, table: String },
+    Manual,
+}
+
+impl FixOp {
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            FixOp::AppendLine { file, line } => format!("append `{line}` to {file}"),
+            FixOp::DeleteMatchingLine { file, contains } => {
+                format!("delete the line containing `{contains}` from {file}")
+            }
+            FixOp::Trash { path } => format!("move {path} to the cxwatch trash"),
+            FixOp::Command { argv } => format!("run `{}`", argv.join(" ")),
+            FixOp::DeleteTomlTable { file, table } => format!("delete the [{table}] block from {file}"),
+            FixOp::Manual => "manual edit needed".into(),
+        }
+    }
+}
+
+fn backticked(s: &str) -> Option<String> {
+    let a = s.find('`')?;
+    let b = s.rfind('`')?;
+    (b > a).then(|| s[a + 1..b].to_string())
+}
+
+/// Derive the mechanical fix for a finding. Manual means: hand it to a human/agent.
+pub(crate) fn fix_op(f: &EstateFinding) -> FixOp {
+    match f.rule {
+        // claude skills live in their own dir; codex/pi skills are plugin/package-managed
+        "dead-skill" if !f.unit.contains(':') => FixOp::Trash {
+            path: Path::new(&f.path)
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| f.path.clone()),
+        },
+        "dead-command" => FixOp::Trash { path: f.path.clone() },
+        "dead-mcp" => {
+            let name = f.unit.rsplit(':').next().unwrap_or("").to_string();
+            if f.unit.contains("claude:") {
+                FixOp::Command { argv: vec!["claude".into(), "mcp".into(), "remove".into(), name] }
+            } else {
+                FixOp::DeleteTomlTable { file: f.path.clone(), table: format!("mcp_servers.{name}") }
+            }
+        }
+        "orphan-memory" => match backticked(&f.fix) {
+            Some(line) => FixOp::AppendLine {
+                file: Path::new(&f.path)
+                    .parent()
+                    .map(|p| p.join("MEMORY.md").display().to_string())
+                    .unwrap_or_else(|| f.path.clone()),
+                line,
+            },
+            None => FixOp::Manual,
+        },
+        "dangling-index" => match backticked(&f.fix) {
+            Some(contains) => FixOp::DeleteMatchingLine { file: f.path.clone(), contains },
+            None => FixOp::Manual,
+        },
+        _ => FixOp::Manual,
+    }
+}
+
+fn trash_dest(path: &str) -> Result<PathBuf> {
+    let dir = crate::cache_dir().join("trash");
+    std::fs::create_dir_all(&dir)?;
+    let epoch = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or("item");
+    Ok(dir.join(format!("{epoch}-{name}")))
+}
+
+fn backup(file: &str) -> Result<()> {
+    if Path::new(file).is_file() {
+        std::fs::copy(file, trash_dest(file)?)?;
+    }
+    Ok(())
+}
+
+/// Apply a mechanical fix. Every destructive step is backed up under ~/.cache/cxwatch/trash.
+pub(crate) fn apply_fix(op: &FixOp) -> Result<String> {
+    match op {
+        FixOp::Manual => anyhow::bail!("no mechanical fix — use the exported plan"),
+        FixOp::AppendLine { file, line } => {
+            backup(file)?;
+            let mut s = std::fs::read_to_string(file).unwrap_or_default();
+            if s.contains(line.as_str()) {
+                return Ok(format!("already present in {file}"));
+            }
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(line);
+            s.push('\n');
+            std::fs::write(file, s)?;
+            Ok(format!("appended to {file}"))
+        }
+        FixOp::DeleteMatchingLine { file, contains } => {
+            backup(file)?;
+            let s = std::fs::read_to_string(file)?;
+            let kept: Vec<&str> = s.lines().filter(|l| !l.contains(contains.as_str())).collect();
+            let removed = s.lines().count() - kept.len();
+            if removed == 0 {
+                anyhow::bail!("no line containing `{contains}` in {file}");
+            }
+            std::fs::write(file, kept.join("\n") + "\n")?;
+            Ok(format!("removed {removed} line(s) from {file}"))
+        }
+        FixOp::Trash { path } => {
+            let dest = trash_dest(path)?;
+            std::fs::rename(path, &dest)?;
+            Ok(format!("moved to {}", dest.display()))
+        }
+        FixOp::Command { argv } => {
+            let out = std::process::Command::new(&argv[0]).args(&argv[1..]).output()?;
+            if out.status.success() {
+                Ok(format!("ran `{}`", argv.join(" ")))
+            } else {
+                anyhow::bail!("`{}` failed: {}", argv.join(" "), String::from_utf8_lossy(&out.stderr).trim())
+            }
+        }
+        FixOp::DeleteTomlTable { file, table } => {
+            backup(file)?;
+            let s = std::fs::read_to_string(file)?;
+            let mut kept = Vec::new();
+            let mut skip = false;
+            let mut removed = 0usize;
+            for line in s.lines() {
+                let t = line.trim();
+                if t.starts_with('[') {
+                    let name = t.trim_matches(['[', ']']).trim_matches('"');
+                    skip = name == table || name.starts_with(&format!("{table}."));
+                }
+                if skip {
+                    removed += 1;
+                } else {
+                    kept.push(line);
+                }
+            }
+            if removed == 0 {
+                anyhow::bail!("no [{table}] block in {file}");
+            }
+            std::fs::write(file, kept.join("\n") + "\n")?;
+            Ok(format!("removed {removed} line(s) ([{table}]) from {file}"))
+        }
+    }
+}
+
+fn fix_flow(r: &EstateReport, yes: bool) -> Result<()> {
+    use std::io::{BufRead, Write};
+    let mechanical: Vec<&EstateFinding> =
+        r.findings.iter().filter(|f| fix_op(f) != FixOp::Manual).collect();
+    if mechanical.is_empty() {
+        println!("no mechanical fixes available — export the plan for the rest (-o plan.md)");
+        return Ok(());
+    }
+    println!(
+        "{} mechanical fixes · backups go to {}",
+        mechanical.len(),
+        crate::cache_dir().join("trash").display()
+    );
+    let (mut applied, mut skipped, mut all) = (0usize, 0usize, yes);
+    let stdin = std::io::stdin();
+    'outer: for f in mechanical {
+        let op = fix_op(f);
+        println!("\n  {:<18} {} — {}", f.rule, f.unit, f.detail);
+        println!("  fix: {}", op.describe());
+        let go = all || {
+            print!("  apply? [y]es [N]o [a]ll [q]uit ");
+            std::io::stdout().flush()?;
+            let mut ans = String::new();
+            stdin.lock().read_line(&mut ans)?;
+            match ans.trim() {
+                "y" | "Y" => true,
+                "a" | "A" => {
+                    all = true;
+                    true
+                }
+                "q" | "Q" => break 'outer,
+                _ => false,
+            }
+        };
+        if go {
+            match apply_fix(&op) {
+                Ok(msg) => {
+                    applied += 1;
+                    println!("  ✔ {msg}");
+                }
+                Err(e) => println!("  ✗ {e}"),
+            }
+        } else {
+            skipped += 1;
+        }
+    }
+    println!("\napplied {applied} · skipped {skipped} · everything else needs the exported plan");
+    Ok(())
+}
+
+pub(crate) fn estate_cmd(
+    json: bool,
+    want_semantic: bool,
+    output: Option<String>,
+    fix: bool,
+    yes: bool,
+) -> Result<()> {
     let mut r = audit();
+    if fix {
+        return fix_flow(&r, yes);
+    }
     if want_semantic {
         r.semantic = Some(semantic_pass(&r).unwrap_or_else(|e| Semantic {
             contradiction: format!("semantic unavailable: {e}"),
@@ -1273,6 +1490,67 @@ mod tests {
             index_links(idx),
             vec!["a.md".to_string(), "b.md".to_string()]
         );
+    }
+
+    fn finding(rule: &'static str, unit: &str, path: &str, fix: &str) -> EstateFinding {
+        EstateFinding {
+            rule,
+            unit: unit.into(),
+            path: path.into(),
+            fix: fix.into(),
+            tokens: 0,
+            uses: 0,
+            detail: String::new(),
+            action: "x",
+        }
+    }
+
+    #[test]
+    fn fix_ops_derived_from_findings() {
+        let f = finding("dead-mcp", "mcp claude:figma", "/h/.claude.json", "");
+        assert_eq!(
+            fix_op(&f),
+            FixOp::Command { argv: vec!["claude".into(), "mcp".into(), "remove".into(), "figma".into()] }
+        );
+        let f = finding("dead-mcp", "mcp codex:figma", "/h/.codex/config.toml", "");
+        assert_eq!(
+            fix_op(&f),
+            FixOp::DeleteTomlTable { file: "/h/.codex/config.toml".into(), table: "mcp_servers.figma".into() }
+        );
+        let f = finding("dead-skill", "skill graphify", "/h/.claude/skills/graphify/SKILL.md", "");
+        assert_eq!(fix_op(&f), FixOp::Trash { path: "/h/.claude/skills/graphify".into() });
+        let f = finding("dead-skill", "skill codex:linear", "/x/SKILL.md", "");
+        assert_eq!(fix_op(&f), FixOp::Manual);
+        let f = finding("orphan-memory", "memory p/a.md", "/m/memory/a.md", "append to /m/memory/MEMORY.md: `- [a](a.md) — d`");
+        assert_eq!(
+            fix_op(&f),
+            FixOp::AppendLine { file: "/m/memory/MEMORY.md".into(), line: "- [a](a.md) — d".into() }
+        );
+        let f = finding("stale-ref", "memory p/b.md", "/m/b.md", "edit it");
+        assert_eq!(fix_op(&f), FixOp::Manual);
+    }
+
+    #[test]
+    fn apply_append_delete_and_toml() {
+        let dir = std::env::temp_dir().join(format!("cxwatch-fix-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let idx = dir.join("MEMORY.md");
+        std::fs::write(&idx, "# Notes\n- [a](a.md) — x\n").unwrap();
+        let file = idx.display().to_string();
+        apply_fix(&FixOp::AppendLine { file: file.clone(), line: "- [b](b.md) — y".into() }).unwrap();
+        assert!(std::fs::read_to_string(&idx).unwrap().contains("(b.md)"));
+        // idempotent
+        let msg = apply_fix(&FixOp::AppendLine { file: file.clone(), line: "- [b](b.md) — y".into() }).unwrap();
+        assert!(msg.contains("already present"));
+        apply_fix(&FixOp::DeleteMatchingLine { file: file.clone(), contains: "(a.md)".into() }).unwrap();
+        assert!(!std::fs::read_to_string(&idx).unwrap().contains("(a.md)"));
+
+        let toml = dir.join("config.toml");
+        std::fs::write(&toml, "[a]\nx = 1\n[mcp_servers.figma]\nurl = \"y\"\n[mcp_servers.figma.env]\nk = \"v\"\n[b]\nz = 2\n").unwrap();
+        apply_fix(&FixOp::DeleteTomlTable { file: toml.display().to_string(), table: "mcp_servers.figma".into() }).unwrap();
+        let s = std::fs::read_to_string(&toml).unwrap();
+        assert!(!s.contains("figma") && s.contains("[a]") && s.contains("[b]"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
