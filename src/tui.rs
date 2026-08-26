@@ -2,11 +2,11 @@ use crate::{Report, SessionMeta, Source};
 use anyhow::Result;
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
+    DefaultTerminal, Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
-    DefaultTerminal, Frame,
 };
 
 pub(crate) fn pick(semantic_on: bool) -> Result<()> {
@@ -47,7 +47,15 @@ impl App {
         let filtered = (0..sessions.len()).collect();
         let mut picker = ListState::default();
         picker.select(Some(0));
-        App { sessions, filtered, query: String::new(), picker, semantic_on, pane: None, flash: None }
+        App {
+            sessions,
+            filtered,
+            query: String::new(),
+            picker,
+            semantic_on,
+            pane: None,
+            flash: None,
+        }
     }
 
     fn run(mut self, t: &mut DefaultTerminal) -> Result<()> {
@@ -56,7 +64,9 @@ impl App {
                 self.fill_previews(t.size()?.height as usize);
             }
             t.draw(|f| self.draw(f))?;
-            let CEvent::Key(k) = event::read()? else { continue };
+            let CEvent::Key(k) = event::read()? else {
+                continue;
+            };
             if k.kind != KeyEventKind::Press {
                 continue;
             }
@@ -70,7 +80,11 @@ impl App {
                     _ => {}
                 }
             }
-            let quit = if self.pane.is_some() { self.pane_key(k.code) } else { self.picker_key(k.code, t) };
+            let quit = if self.pane.is_some() {
+                self.pane_key(k.code)
+            } else {
+                self.picker_key(k.code, t)
+            };
             if quit {
                 return Ok(());
             }
@@ -110,6 +124,10 @@ impl App {
                 self.refilter();
             }
             KeyCode::Char(c) => {
+                if self.query.is_empty() {
+                    Self::busy_frame(t, "indexing session previews …".into());
+                    self.index_previews();
+                }
                 self.query.push(c);
                 self.refilter();
             }
@@ -137,25 +155,52 @@ impl App {
                 q.is_empty()
                     || s.source.label().contains(&q)
                     || s.title.to_lowercase().contains(&q)
-                    || s.preview.as_deref().unwrap_or("").to_lowercase().contains(&q)
+                    || s.preview
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&q)
             })
             .map(|(i, _)| i)
             .collect();
-        self.picker.select(if self.filtered.is_empty() { None } else { Some(0) });
+        self.picker.select(if self.filtered.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
         *self.picker.offset_mut() = 0;
+    }
+
+    fn index_previews(&mut self) {
+        for session in &mut self.sessions {
+            if session.preview.is_none() {
+                session.preview = Some(crate::preview(session.source, &session.path));
+            }
+        }
     }
 
     fn busy_frame(t: &mut DefaultTerminal, msg: String) {
         let _ = t.draw(|f| {
-            f.render_widget(Paragraph::new(format!("\n  {msg}")).block(Block::bordered().title(" cxwatch ")), f.area());
+            f.render_widget(
+                Paragraph::new(format!("\n  {msg}")).block(Block::bordered().title(" cxwatch ")),
+                f.area(),
+            );
         });
     }
 
     fn open_selected(&mut self, t: &mut DefaultTerminal) {
-        let Some(sel) = self.picker.selected() else { return };
-        let Some(&si) = self.filtered.get(sel) else { return };
+        let Some(sel) = self.picker.selected() else {
+            return;
+        };
+        let Some(&si) = self.filtered.get(sel) else {
+            return;
+        };
         let meta = self.sessions[si].clone();
-        let note = if self.semantic_on { " + semantic LLM pass (may take a minute)" } else { "" };
+        let note = if self.semantic_on {
+            " + semantic LLM pass (may take a minute)"
+        } else {
+            ""
+        };
         Self::busy_frame(t, format!("analyzing {} …{note}", meta.title));
         match crate::parse(&meta.path) {
             Err(e) => self.flash = Some(format!("cannot parse {}: {e}", meta.path.display())),
@@ -164,11 +209,16 @@ impl App {
                     crate::semantic(&events).unwrap_or_else(|e| crate::Semantic {
                         contradiction: format!("semantic unavailable: {e}"),
                         bloating: String::new(),
-                        model_used: crate::SEMANTIC_MODEL.into(),
+                        model_used: crate::semantic_model(),
                     })
                 });
                 let report = crate::build_report(meta.path.display().to_string(), &events, sem);
-                let stem = meta.path.file_stem().and_then(|s| s.to_str()).unwrap_or("session").to_string();
+                let stem = meta
+                    .path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("session")
+                    .to_string();
                 self.pane = Some(Pane {
                     block_title: " report ",
                     header: report_header(&meta, &report),
@@ -184,15 +234,24 @@ impl App {
 
     fn open_estate(&mut self, t: &mut DefaultTerminal) {
         self.flash = None;
-        Self::busy_frame(t, "auditing static context (scans all transcripts — can take a few seconds) …".into());
+        Self::busy_frame(
+            t,
+            "auditing static context (scans all transcripts — can take a few seconds) …".into(),
+        );
         let mut report = crate::estate::audit();
         if self.semantic_on {
-            Self::busy_frame(t, "running semantic contradiction/duplication pass (may take a minute) …".into());
-            report.semantic = Some(crate::estate::semantic_pass(&report).unwrap_or_else(|e| crate::Semantic {
-                contradiction: format!("semantic unavailable: {e}"),
-                bloating: String::new(),
-                model_used: crate::SEMANTIC_MODEL.into(),
-            }));
+            Self::busy_frame(
+                t,
+                "running semantic contradiction/duplication pass (may take a minute) …".into(),
+            );
+            report.semantic =
+                Some(
+                    crate::estate::semantic_pass(&report).unwrap_or_else(|e| crate::Semantic {
+                        contradiction: format!("semantic unavailable: {e}"),
+                        bloating: String::new(),
+                        model_used: crate::semantic_model(),
+                    }),
+                );
         }
         let (lines, fixes) = estate_lines(&report);
         self.pane = Some(Pane {
@@ -250,8 +309,12 @@ impl App {
     }
 
     fn draw_picker(&mut self, f: &mut Frame) {
-        let [list_area, status_area, keys_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
+        let [list_area, status_area, keys_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .areas(f.area());
         let w = list_area.width.saturating_sub(3) as usize;
 
         let items: Vec<ListItem> = self
@@ -265,12 +328,25 @@ impl App {
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("{:<7}", s.source.label()),
-                        Style::new().fg(source_color(s.source)).add_modifier(Modifier::BOLD),
+                        Style::new()
+                            .fg(source_color(s.source))
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!("{:>4} ", crate::ago(s.modified)), Style::new().fg(Color::DarkGray)),
-                    Span::styled(format!("{:>6}  ", crate::size_fmt(s.size)), Style::new().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:>4} ", crate::ago(s.modified)),
+                        Style::new().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{:>6}  ", crate::size_fmt(s.size)),
+                        Style::new().fg(Color::DarkGray),
+                    ),
                     Span::raw(format!("{title:<40}")),
-                    Span::styled(preview, Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+                    Span::styled(
+                        preview,
+                        Style::new()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
                 ]))
             })
             .collect();
@@ -304,19 +380,28 @@ impl App {
             right,
         );
 
-        self.draw_help(f, keys_area, " type to filter · ↑↓ move · enter analyze · ^e estate audit · tab semantic · esc quit");
+        self.draw_help(
+            f,
+            keys_area,
+            " type to filter · ↑↓ move · enter analyze · ^e estate audit · tab semantic · esc quit",
+        );
     }
 
     fn draw_pane(&mut self, f: &mut Frame) {
         let pane = self.pane.as_mut().expect("pane");
         let head_h = pane.header.len() as u16 + 2;
-        let [head, body, keys_area] =
-            Layout::vertical([Constraint::Length(head_h), Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
+        let [head, body, keys_area] = Layout::vertical([
+            Constraint::Length(head_h),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(f.area());
         f.render_widget(
             Paragraph::new(pane.header.clone()).block(Block::bordered().title(pane.block_title)),
             head,
         );
-        let list = List::new(pane.lines.clone()).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let list = List::new(pane.lines.clone())
+            .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, body, &mut pane.list);
         let help = if pane.fixes.is_empty() {
             " ↑↓ scroll · e export md · esc back · q quit"
@@ -347,11 +432,17 @@ fn semantic_lines(out: &mut Vec<Line<'static>>, sem: &crate::Semantic, second_la
         format!(" semantic analysis ({})", sem.model_used),
         Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
     )));
-    out.push(Line::from(Span::styled(" contradictions:", Style::new().fg(Color::DarkGray))));
+    out.push(Line::from(Span::styled(
+        " contradictions:",
+        Style::new().fg(Color::DarkGray),
+    )));
     for l in sem.contradiction.lines() {
         out.push(Line::raw(format!("   {l}")));
     }
-    out.push(Line::from(Span::styled(format!(" {second_label}:"), Style::new().fg(Color::DarkGray))));
+    out.push(Line::from(Span::styled(
+        format!(" {second_label}:"),
+        Style::new().fg(Color::DarkGray),
+    )));
     for l in sem.bloating.lines() {
         out.push(Line::raw(format!("   {l}")));
     }
@@ -366,7 +457,10 @@ fn report_header(meta: &SessionMeta, r: &Report) -> Vec<Line<'static>> {
             format!("[{}] {}", meta.source.label(), meta.title),
             Style::new().add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(r.session.clone(), Style::new().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            r.session.clone(),
+            Style::new().fg(Color::DarkGray),
+        )),
         Line::from(vec![
             Span::raw(format!(
                 "events {} · session ≈{} tok · ",
@@ -380,7 +474,11 @@ fn report_header(meta: &SessionMeta, r: &Report) -> Vec<Line<'static>> {
                     crate::tok_fmt(s.reclaimable_tokens),
                     s.reclaimable_pct
                 ),
-                Style::new().fg(if s.findings == 0 { Color::Green } else { Color::Yellow }),
+                Style::new().fg(if s.findings == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
             ),
         ]),
     ]
@@ -398,10 +496,15 @@ fn report_lines(r: &Report) -> Vec<Line<'static>> {
         out.push(Line::from(vec![
             Span::styled(
                 format!(" {:<16}", f.rule),
-                Style::new().fg(rule_color(f.rule)).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(rule_color(f.rule))
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("{:>7} ", format!("~{}", crate::tok_fmt(f.tokens)))),
-            Span::styled(format!("{:>6} ", format!("#{}", f.event_idx)), Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:>6} ", format!("#{}", f.event_idx)),
+                Style::new().fg(Color::DarkGray),
+            ),
             Span::raw(f.detail.clone()),
         ]));
     }
@@ -417,7 +520,10 @@ fn estate_header(r: &crate::estate::EstateReport) -> Vec<Line<'static>> {
     let s = &r.summary;
     let mut out = vec![
         Line::from(vec![
-            Span::styled("context estate audit", Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "context estate audit",
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!(
                     "   static context vs usage in {} claude · {} codex · {} pi sessions",
@@ -433,7 +539,11 @@ fn estate_header(r: &crate::estate::EstateReport) -> Vec<Line<'static>> {
                 s.findings,
                 crate::tok_fmt(s.tokens_flagged)
             ),
-            Style::new().fg(if s.findings == 0 { Color::Green } else { Color::Yellow }),
+            Style::new().fg(if s.findings == 0 {
+                Color::Green
+            } else {
+                Color::Yellow
+            }),
         )),
     ];
     // stacked bar: flagged tokens by category
@@ -450,7 +560,7 @@ fn estate_header(r: &crate::estate::EstateReport) -> Vec<Line<'static>> {
             let tokens: usize = group.iter().map(|f| f.tokens).sum();
             if tokens > 0 {
                 bar.push(Span::styled(
-                    "█".repeat((tokens * BAR_W / total).max(1)),
+                    "█".repeat((tokens * BAR_W).checked_div(total).unwrap_or(0).max(1)),
                     Style::new().fg(rule_color(rule)),
                 ));
             }
@@ -460,7 +570,10 @@ fn estate_header(r: &crate::estate::EstateReport) -> Vec<Line<'static>> {
             } else {
                 format!("{}×", group.len())
             };
-            legend.push(Span::styled(format!("{rule} {amount}  "), Style::new().fg(Color::DarkGray)));
+            legend.push(Span::styled(
+                format!("{rule} {amount}  "),
+                Style::new().fg(Color::DarkGray),
+            ));
         }
         out.push(Line::from(bar));
         out.push(Line::from(legend));
@@ -472,17 +585,25 @@ fn estate_lines(r: &crate::estate::EstateReport) -> (Vec<Line<'static>>, Vec<Opt
     let mut out = Vec::new();
     let mut fixes = Vec::new();
     if r.findings.is_empty() {
-        out.push(Line::from(Span::styled(" ✔ estate is clean", Style::new().fg(Color::Green))));
+        out.push(Line::from(Span::styled(
+            " ✔ estate is clean",
+            Style::new().fg(Color::Green),
+        )));
         fixes.push(None);
     }
     for f in &r.findings {
         out.push(Line::from(vec![
             Span::styled(
                 format!(" {:<20}", f.rule),
-                Style::new().fg(rule_color(f.rule)).add_modifier(Modifier::BOLD),
+                Style::new()
+                    .fg(rule_color(f.rule))
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("{:>7} ", crate::estate::tok_or_unknown(f.tokens))),
-            Span::styled(format!("{:>4} ", format!("{}×", f.uses)), Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:>4} ", format!("{}×", f.uses)),
+                Style::new().fg(Color::DarkGray),
+            ),
             Span::raw(format!("{} — {} ", f.unit, f.detail)),
             Span::styled(format!("→ {}", f.action), Style::new().fg(Color::Green)),
         ]));

@@ -2,6 +2,12 @@
 name = "cxwatch"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Audit stale session context and unused configuration for AI coding agents"
+license = "MIT"
+repository = "https://github.com/aalises/dalekohled"
+readme = "README.md"
+exclude = [".github", "demo.mp4", "demo.tape"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

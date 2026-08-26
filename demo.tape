@@ -1,7 +1,6 @@
 # cxwatch demo — render with: vhs demo.tape
 # Re-record any time; tweak the filter string to feature a different session.
 
-Output demo.gif
 Output demo.mp4
 
 Set Shell "zsh"
