@@ -1,36 +1,45 @@
 # Releasing
 
-## Private beta (current)
+## Current state: launch-ready, repo private
 
-Collaborators install with:
+Everything below is done. Going public is: **Settings → make repository public**, and announce.
+
+- ✅ **Demo scrubbed** — `demo.tape` stages a synthetic `$HOME` (`demo/fixtures.py`); recordings
+  contain no real session data, with product-marketing chapter cards per act.
+- ✅ **History purged** — old recordings with real session previews were removed with
+  `git filter-repo`; history was force-pushed. (Collaborators: re-clone, don't pull.)
+- ✅ **`v0.1.0` release staged** — the dist workflow builds macOS (arm/x64), Linux (arm/x64),
+  Windows, the `cxwatch-installer.sh` one-liner, a Homebrew formula artifact and an npm package
+  artifact, all attached to the (currently private) release. The moment the repo is public:
+
+  ```bash
+  curl -fsSL https://github.com/aalises/dalekohled/releases/latest/download/cxwatch-installer.sh | sh
+  ```
+
+## Still manual at launch (optional, ~10 min each)
+
+- **Homebrew tap** (`brew install aalises/tap/cxwatch`): create public repo `aalises/homebrew-tap`,
+  add under `[dist]` in `dist-workspace.toml`: `tap = "aalises/homebrew-tap"` and
+  `publish-jobs = ["homebrew"]`, add a `HOMEBREW_TAP_TOKEN` repo secret (PAT with write access to
+  the tap), re-tag.
+- **npm** (`npx cxwatch`): reserve the package name, add `NPM_TOKEN` secret and
+  `publish-jobs = ["npm"]`, re-tag.
+- **crates.io**: `cargo publish` — the name claim is permanent, decide first.
+
+## Cutting a release
+
+Bump `version` in `Cargo.toml`, commit, then:
 
 ```bash
-gh release download v0.1.0-beta.1 -R aalises/dalekohled -p '*aarch64*' -O - | tar -xz
+git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-or `cargo install --git https://github.com/aalises/dalekohled`.
+The dist workflow builds every target and attaches all artifacts to the GitHub release.
 
-To cut a new beta: build locally, `tar -czf`, and `gh release create vX.Y.Z-beta.N <tarball> --prerelease`.
-Note: any `v*` tag push now triggers `.github/workflows/release.yml` (dist), which builds all
-targets in CI and attaches them to the release automatically — so `gh release create` with just
-notes (no local tarball) is enough once CI is green.
+## Private beta installs (while the repo is private)
 
-## Public launch checklist
-
-1. **Scrub the demo.** `demo.gif`/`demo.mp4` show real session previews. Re-record against a staged
-   `$HOME` with fixture sessions (`HOME=/tmp/demo-home vhs demo.tape`), or curate the filters in
-   `demo.tape`. Skim every frame before publishing.
-2. **Check history.** The git history is clean (code + docs only), but do a final
-   `git log -p | grep -iE 'token|secret|key'` pass.
-3. **Make the repo public.** GitHub → Settings → Danger Zone.
-4. **Tag `v0.1.0`.** dist CI builds macOS (arm/x64), Linux (arm/x64), Windows, and attaches:
-   - `cxwatch-installer.sh` → users run `curl -fsSL https://github.com/aalises/dalekohled/releases/latest/download/cxwatch-installer.sh | sh`
-   - a Homebrew formula artifact and an npm package artifact.
-5. **Optional publishing** (each needs one-time setup):
-   - **Homebrew tap**: create public repo `aalises/homebrew-tap`, add `tap = "aalises/homebrew-tap"`
-     and `publish-jobs = ["homebrew"]` under `[dist]`, and a `HOMEBREW_TAP_TOKEN` repo secret
-     (a PAT with write access to the tap). Then `brew install aalises/tap/cxwatch` works.
-   - **npm**: reserve the package name, add an `NPM_TOKEN` secret and `publish-jobs = ["npm"]`.
-     Then `npx cxwatch` works.
-   - **crates.io**: `cargo publish` (name claim is permanent — decide the name first).
-6. **Announce** with the demo mp4.
+```bash
+gh release download v0.1.0 -R aalises/dalekohled -p '*aarch64-apple-darwin*' -O - | tar -xz
+# or
+cargo install --git https://github.com/aalises/dalekohled
+```
