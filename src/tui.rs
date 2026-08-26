@@ -28,6 +28,8 @@ struct App {
     semantic_on: bool,
     pane: Option<Pane>,
     flash: Option<String>,
+    /// Line index of a fix awaiting its second `f` press.
+    pending_fix: Option<usize>,
 }
 
 /// A scrollable results view (session report or estate audit).
@@ -35,8 +37,8 @@ struct Pane {
     block_title: &'static str,
     header: Vec<Line<'static>>,
     lines: Vec<Line<'static>>,
-    /// Parallel to `lines`: the concrete fix shown when Enter is pressed on a row.
-    fixes: Vec<Option<String>>,
+    /// Parallel to `lines`: the fix text (Enter) and mechanical fix op (f) per row.
+    fixes: Vec<Option<(String, crate::estate::FixOp)>>,
     list: ListState,
     export_name: String,
     export_md: String,
@@ -55,6 +57,7 @@ impl App {
             semantic_on,
             pane: None,
             flash: None,
+            pending_fix: None,
         }
     }
 
@@ -269,6 +272,7 @@ impl App {
 
     fn pane_key(&mut self, code: KeyCode) -> bool {
         self.flash = None;
+        let pending = self.pending_fix.take();
         let pane = self.pane.as_mut().expect("pane");
         let max = pane.lines.len().saturating_sub(1) as isize;
         fn scroll(list: &mut ListState, d: isize, max: isize) {
@@ -281,8 +285,37 @@ impl App {
             KeyCode::PageUp => scroll(&mut pane.list, -15, max),
             KeyCode::PageDown => scroll(&mut pane.list, 15, max),
             KeyCode::Enter => {
-                if let Some(Some(fix)) = pane.fixes.get(pane.list.selected().unwrap_or(0)) {
+                if let Some(Some((fix, _))) = pane.fixes.get(pane.list.selected().unwrap_or(0)) {
                     self.flash = Some(format!("fix → {fix}"));
+                }
+            }
+            KeyCode::Char('f') => {
+                let sel = pane.list.selected().unwrap_or(0);
+                match pane.fixes.get(sel) {
+                    Some(Some((_, op))) if *op != crate::estate::FixOp::Manual => {
+                        if pending == Some(sel) {
+                            let op = op.clone();
+                            self.flash = Some(match crate::estate::apply_fix(&op) {
+                                Ok(msg) => {
+                                    pane.lines[sel] = Line::from(Span::styled(
+                                        format!(" ✔ fixed — {msg}"),
+                                        Style::new().fg(Color::Green),
+                                    ));
+                                    pane.fixes[sel] = None;
+                                    format!("✔ {msg}")
+                                }
+                                Err(e) => format!("✗ {e}"),
+                            });
+                        } else {
+                            self.pending_fix = Some(sel);
+                            self.flash =
+                                Some(format!("apply: {} — press f again to confirm", op.describe()));
+                        }
+                    }
+                    Some(Some(_)) => {
+                        self.flash = Some("no mechanical fix for this row — use the exported plan (e)".into());
+                    }
+                    _ => {}
                 }
             }
             KeyCode::Char('e') => {
@@ -406,7 +439,7 @@ impl App {
         let help = if pane.fixes.is_empty() {
             " ↑↓ scroll · e export md · esc back · q quit"
         } else {
-            " ↑↓ scroll · enter show fix · e export md · esc back · q quit"
+            " ↑↓ scroll · enter show fix · f apply fix · e export md · esc back · q quit"
         };
         self.draw_help(f, keys_area, help);
     }
@@ -581,7 +614,9 @@ fn estate_header(r: &crate::estate::EstateReport) -> Vec<Line<'static>> {
     out
 }
 
-fn estate_lines(r: &crate::estate::EstateReport) -> (Vec<Line<'static>>, Vec<Option<String>>) {
+fn estate_lines(
+    r: &crate::estate::EstateReport,
+) -> (Vec<Line<'static>>, Vec<Option<(String, crate::estate::FixOp)>>) {
     let mut out = Vec::new();
     let mut fixes = Vec::new();
     if r.findings.is_empty() {
@@ -607,7 +642,7 @@ fn estate_lines(r: &crate::estate::EstateReport) -> (Vec<Line<'static>>, Vec<Opt
             Span::raw(format!("{} — {} ", f.unit, f.detail)),
             Span::styled(format!("→ {}", f.action), Style::new().fg(Color::Green)),
         ]));
-        fixes.push(Some(f.fix.clone()));
+        fixes.push(Some((f.fix.clone(), crate::estate::fix_op(f))));
     }
     if let Some(sem) = &r.semantic {
         semantic_lines(&mut out, sem, "duplication");
