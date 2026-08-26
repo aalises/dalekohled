@@ -131,8 +131,18 @@ Everything is report-only — the human (or their agent, with confirmation) deci
 
 ## Demo
 
-`demo.tape` is a [VHS](https://github.com/charmbracelet/vhs) script — re-record with `vhs demo.tape`.
-Note: recordings show real session previews from the machine they run on.
+The recording is made with [VHS](https://github.com/charmbracelet/vhs) (by Charm): you script the
+keystrokes in a `.tape` file (`Type "cxwatch"`, `Ctrl+E`, `Sleep 3.5s`, …), and VHS replays them into a
+real headless terminal and renders every frame to GIF/MP4 — themes, fonts and padding included. The demo
+is *code*: deterministic, diffable, and re-recordable after every feature.
+
+```bash
+brew install vhs
+vhs demo.tape        # regenerates demo.gif + demo.mp4
+```
+
+Note: recordings show real session previews and estate findings from the machine they run on — review
+before sharing.
 
 ## Tests
 
