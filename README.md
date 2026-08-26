@@ -296,7 +296,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The terminal demo uses [VHS](https://github.com/charmbracelet/vhs). The repository includes `demo.tape` and the generated `demo.gif`. The recording can contain real project names and local findings. Review the media before you publish it.
+The terminal demo uses [VHS](https://github.com/charmbracelet/vhs). The repository includes `demo.tape` and the generated `demo.gif`. The tape stages a synthetic `$HOME` with `demo/fixtures.py` before recording, so the published media contains no real session data. Re-record with `vhs demo.tape`.
 
 ## License
 
