@@ -1,0 +1,970 @@
+mod estate;
+mod tui;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+pub(crate) const REPORT_VERSION: u8 = 2;
+const THINKING_THRESHOLD: usize = 2_000;
+const OUTPUT_THRESHOLD: usize = 2_500;
+pub(crate) const SEMANTIC_MODEL: &str = "moonshotai/kimi-k3";
+const SEMANTIC_DIGEST_CAP: usize = 60_000;
+
+#[derive(Parser)]
+#[command(name = "cxwatch", about = "Context hygiene for agent sessions (pi, Claude Code, Codex)")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Scan a session (default: most recent session across all harnesses)
+    Report {
+        session: Option<PathBuf>,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+        /// Also run LLM semantic analysis
+        #[arg(long)]
+        semantic: bool,
+    },
+    /// Write a Markdown report (includes semantic pass)
+    Explain {
+        session: Option<PathBuf>,
+        /// Output file (default: cxwatch-demo.md)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// List available sessions
+    Sessions,
+    /// Interactive session picker
+    Pick {
+        /// Start with the LLM semantic pass enabled
+        #[arg(long)]
+        semantic: bool,
+    },
+    /// Audit static context (skills, commands, MCP, memory) against observed usage
+    Estate {
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+        /// Also run LLM contradiction/duplication analysis
+        #[arg(long)]
+        semantic: bool,
+        /// Write an agent-ready Markdown pruning plan to this file
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+fn main() -> Result<()> {
+    match Cli::parse().cmd {
+        None => tui::pick(false),
+        Some(Cmd::Report { session, json, semantic }) => report_cmd(session, json, semantic),
+        Some(Cmd::Explain { session, output }) => explain_cmd(session, output),
+        Some(Cmd::Sessions) => sessions_cmd(),
+        Some(Cmd::Pick { semantic }) => tui::pick(semantic),
+        Some(Cmd::Estate { json, semantic, output }) => estate::estate_cmd(json, semantic, output),
+    }
+}
+
+// ---------- session discovery ----------
+
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Source {
+    Pi,
+    Claude,
+    Codex,
+}
+
+impl Source {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Source::Pi => "pi",
+            Source::Claude => "claude",
+            Source::Codex => "codex",
+        }
+    }
+}
+
+fn roots() -> Vec<(Source, PathBuf)> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    vec![
+        (Source::Pi, home.join(".pi/agent/sessions")),
+        (Source::Claude, home.join(".claude/projects")),
+        (Source::Codex, home.join(".codex/sessions")),
+        (Source::Codex, home.join(".codex/archived_sessions")),
+    ]
+}
+
+pub(crate) fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk_jsonl(&p, out);
+            } else if p.extension().is_some_and(|x| x == "jsonl") {
+                out.push(p);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionMeta {
+    pub source: Source,
+    pub path: PathBuf,
+    pub title: String,
+    pub modified: SystemTime,
+    pub size: u64,
+    /// First real user prompt, filled lazily by the TUI.
+    pub preview: Option<String>,
+}
+
+pub(crate) fn sessions() -> Vec<SessionMeta> {
+    let mut out = Vec::new();
+    for (source, root) in roots() {
+        let mut files = Vec::new();
+        walk_jsonl(&root, &mut files);
+        for path in files {
+            let md = path.metadata().ok();
+            let modified = md.as_ref().and_then(|m| m.modified().ok()).unwrap_or(SystemTime::UNIX_EPOCH);
+            let size = md.map(|m| m.len()).unwrap_or(0);
+            let title = title_for(source, &path);
+            out.push(SessionMeta { source, path, title, modified, size, preview: None });
+        }
+    }
+    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out
+}
+
+fn title_for(source: Source, path: &Path) -> String {
+    let parent = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or("");
+    match source {
+        // dir name encodes the cwd, e.g. "--Users-me-dev-cxwatch--" / "-Users-me-dev-cxwatch"
+        Source::Pi | Source::Claude => decode_slug(parent),
+        // filename: rollout-<date>T<time>-<uuid>.jsonl
+        Source::Codex => {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+            let s = stem.strip_prefix("rollout-").unwrap_or(stem);
+            if s.len() > 37 {
+                format!("{} {}", &s[..s.len() - 37], &s[s.len() - 36..s.len() - 28])
+            } else {
+                s.into()
+            }
+        }
+    }
+}
+
+pub(crate) fn decode_slug(slug: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default().replace('/', "-");
+    let t = slug.trim_matches('-');
+    let t = t.strip_prefix(home.trim_matches('-')).unwrap_or(t).trim_matches('-');
+    if t.is_empty() { "~".into() } else { t.replace('-', "/") }
+}
+
+fn latest_session() -> Result<PathBuf> {
+    sessions()
+        .into_iter()
+        .next()
+        .map(|s| s.path)
+        .ok_or_else(|| anyhow::anyhow!("no sessions found under ~/.pi, ~/.claude or ~/.codex"))
+}
+
+/// First real user prompt of a session, for the picker. Scans only the head of the file.
+pub(crate) fn preview(source: Source, path: &Path) -> String {
+    use std::io::{BufRead, BufReader, Read};
+    let Ok(f) = std::fs::File::open(path) else { return String::new() };
+    let reader = BufReader::new(f.take(512 * 1024));
+    for line in reader.lines().map_while(Result::ok).take(120) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let text = match source {
+            Source::Pi => (v["type"] == "message" && v["message"]["role"] == "user")
+                .then(|| first_text(&v["message"]["content"]))
+                .flatten(),
+            Source::Claude => (v["type"] == "user" && v["isMeta"] != true)
+                .then(|| first_text(&v["message"]["content"]))
+                .flatten(),
+            Source::Codex => (v["type"] == "response_item"
+                && v["payload"]["type"] == "message"
+                && v["payload"]["role"] == "user")
+                .then(|| first_text(&v["payload"]["content"]))
+                .flatten(),
+        };
+        if let Some(t) = text {
+            let t = t.trim();
+            // skip injected context: tags, caveats, AGENTS.md preambles
+            if t.is_empty() || t.starts_with('<') || t.starts_with('#') || t.starts_with("Caveat:") {
+                continue;
+            }
+            return clip(&t.split_whitespace().collect::<Vec<_>>().join(" "), 100);
+        }
+    }
+    String::new()
+}
+
+fn first_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => items.iter().find_map(|i| {
+            matches!(i["type"].as_str(), Some("text" | "input_text"))
+                .then(|| i["text"].as_str().map(String::from))
+                .flatten()
+        }),
+        _ => None,
+    }
+}
+
+// ---------- unified event model ----------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Action {
+    Read,
+    Mutate,
+}
+
+#[derive(Clone)]
+pub(crate) enum Item {
+    Text(String),
+    Thinking(String),
+    ToolCall { call_id: String, desc: String, targets: Vec<(Action, String)> },
+    ToolResult { call_id: String, tokens: usize },
+}
+
+#[derive(Clone)]
+pub(crate) struct Event {
+    pub id: String,
+    pub role: String,
+    pub items: Vec<Item>,
+}
+
+pub(crate) fn parse(path: &Path) -> Result<Vec<Event>> {
+    let s = std::fs::read_to_string(path)?;
+    Ok(s.lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| parse_line(&v))
+        .collect())
+}
+
+fn parse_line(v: &Value) -> Option<Event> {
+    match v["type"].as_str()? {
+        // pi: {"type":"message","id":..,"message":{"role":..,"content":[..]}}
+        "message" => {
+            let m = &v["message"];
+            let id = v["id"].as_str().unwrap_or("").to_string();
+            let role = m["role"].as_str()?.to_string();
+            if role == "toolResult" {
+                return Some(Event {
+                    id,
+                    role,
+                    items: vec![Item::ToolResult {
+                        call_id: m["toolCallId"].as_str().unwrap_or("").into(),
+                        tokens: estimate_tokens(&text_of(&m["content"])),
+                    }],
+                });
+            }
+            Some(Event { id, role, items: body_items(&m["content"]) })
+        }
+        // Claude Code: {"type":"user"|"assistant","uuid":..,"message":{"role":..,"content":str|[..]}}
+        "user" | "assistant" => {
+            let m = &v["message"];
+            let id = v["uuid"].as_str().unwrap_or("").to_string();
+            let role = m["role"].as_str().or(v["type"].as_str()).unwrap_or("unknown").to_string();
+            Some(Event { id, role, items: body_items(&m["content"]) })
+        }
+        // Codex: {"type":"response_item","payload":{"type":"message"|"function_call"|..}}
+        "response_item" => {
+            let p = &v["payload"];
+            match p["type"].as_str()? {
+                "message" => Some(Event {
+                    id: p["id"].as_str().unwrap_or("").to_string(),
+                    role: p["role"].as_str().unwrap_or("unknown").to_string(),
+                    items: p["content"]
+                        .as_array()?
+                        .iter()
+                        .filter(|i| matches!(i["type"].as_str(), Some("input_text" | "output_text" | "text")))
+                        .map(|i| Item::Text(i["text"].as_str().unwrap_or("").into()))
+                        .collect(),
+                }),
+                "function_call" => {
+                    let call_id = p["call_id"].as_str().unwrap_or("").to_string();
+                    // arguments arrive as a JSON-encoded string
+                    let args: Value = p["arguments"]
+                        .as_str()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_else(|| p["arguments"].clone());
+                    let name = p["name"].as_str().unwrap_or("");
+                    Some(Event {
+                        id: call_id.clone(),
+                        role: "assistant".into(),
+                        items: vec![tool_call_item(call_id, name, &args)],
+                    })
+                }
+                "function_call_output" => {
+                    let call_id = p["call_id"].as_str().unwrap_or("").to_string();
+                    Some(Event {
+                        id: call_id.clone(),
+                        role: "tool".into(),
+                        items: vec![Item::ToolResult { call_id, tokens: estimate_tokens(&text_of(&p["output"])) }],
+                    })
+                }
+                "reasoning" => {
+                    let t = p["summary"]
+                        .as_array()?
+                        .iter()
+                        .filter_map(|s| s["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!t.is_empty()).then(|| Event {
+                        id: p["id"].as_str().unwrap_or("").to_string(),
+                        role: "assistant".into(),
+                        items: vec![Item::Thinking(t)],
+                    })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn body_items(content: &Value) -> Vec<Item> {
+    match content {
+        Value::String(s) => vec![Item::Text(s.clone())],
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|i| match i["type"].as_str()? {
+                "text" => Some(Item::Text(i["text"].as_str().unwrap_or("").into())),
+                "thinking" => Some(Item::Thinking(i["thinking"].as_str().unwrap_or("").into())),
+                // pi style
+                "toolCall" => Some(tool_call_item(
+                    i["id"].as_str().unwrap_or("").into(),
+                    i["name"].as_str().unwrap_or(""),
+                    &i["arguments"],
+                )),
+                // Claude Code style
+                "tool_use" => Some(tool_call_item(
+                    i["id"].as_str().unwrap_or("").into(),
+                    i["name"].as_str().unwrap_or(""),
+                    &i["input"],
+                )),
+                "tool_result" => Some(Item::ToolResult {
+                    call_id: i["tool_use_id"].as_str().unwrap_or("").into(),
+                    tokens: estimate_tokens(&text_of(&i["content"])),
+                }),
+                _ => None,
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn tool_call_item(call_id: String, name: &str, args: &Value) -> Item {
+    let targets = tool_targets(name, args);
+    let desc = if let Some((_, p)) = targets.first() {
+        format!("{name} {p}")
+    } else if let Some(c) = args["command"].as_str().or(args["cmd"].as_str()) {
+        format!("{name} `{}`", clip(&c.split_whitespace().collect::<Vec<_>>().join(" "), 48))
+    } else {
+        name.to_string()
+    };
+    Item::ToolCall { call_id, desc, targets }
+}
+
+fn tool_targets(name: &str, args: &Value) -> Vec<(Action, String)> {
+    let file = || {
+        ["path", "file_path", "notebook_path"]
+            .iter()
+            .find_map(|k| args[*k].as_str())
+            .map(String::from)
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "read" => file().map(|p| (Action::Read, p)).into_iter().collect(),
+        "write" | "edit" | "multiedit" | "notebookedit" => {
+            file().map(|p| (Action::Mutate, p)).into_iter().collect()
+        }
+        "bash" | "exec_command" | "shell" | "local_shell" => {
+            let cmd = args["command"]
+                .as_str()
+                .map(String::from)
+                .or_else(|| {
+                    args["command"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" "))
+                })
+                .or_else(|| args["cmd"].as_str().map(String::from));
+            cmd.map(|c| shell_read_targets(&c)).unwrap_or_default()
+        }
+        "apply_patch" => patch_targets(args["input"].as_str().unwrap_or("")),
+        _ => vec![],
+    }
+}
+
+/// Detect file reads done through the shell (cat/head/sed -n ... — how Codex reads files).
+fn shell_read_targets(cmd: &str) -> Vec<(Action, String)> {
+    let mut out = Vec::new();
+    for seg in cmd.replace("&&", ";").split(['|', ';', '\n']) {
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        let Some(&first) = toks.first() else { continue };
+        let is_reader = matches!(first, "cat" | "head" | "tail" | "less" | "more" | "bat")
+            || (first == "sed" && !toks.contains(&"-i"));
+        if is_reader {
+            if let Some(p) = last_pathish(&toks[1..]) {
+                out.push((Action::Read, p));
+            }
+        }
+    }
+    out
+}
+
+fn last_pathish(toks: &[&str]) -> Option<String> {
+    toks.iter().rev().find_map(|t| {
+        let t = t.trim_matches(|c| c == '\'' || c == '"');
+        (!t.is_empty()
+            && !t.starts_with('-')
+            && !t.starts_with(|c: char| c.is_ascii_digit())
+            && !t.contains(['$', '`', '*']))
+        .then(|| t.to_string())
+    })
+}
+
+fn patch_targets(patch: &str) -> Vec<(Action, String)> {
+    patch
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("*** Update File: ")
+                .or_else(|| l.strip_prefix("*** Add File: "))
+                .or_else(|| l.strip_prefix("*** Delete File: "))
+                .map(|p| (Action::Mutate, p.trim().to_string()))
+        })
+        .collect()
+}
+
+pub(crate) fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
+fn text_of(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(|i| i["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+// ---------- rules ----------
+
+#[derive(Serialize, Clone)]
+pub(crate) struct Finding {
+    pub rule: &'static str,
+    pub event_idx: usize,
+    pub event_id: String,
+    pub detail: String,
+    pub tokens: usize,
+}
+
+struct Op {
+    idx: usize,
+    id: String,
+    call_id: String,
+    action: Action,
+    path: String,
+}
+
+pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut ops: Vec<Op> = Vec::new();
+    let mut result_tokens: HashMap<String, usize> = HashMap::new();
+    let mut call_desc: HashMap<String, String> = HashMap::new();
+    let mut results: Vec<(usize, String, String)> = Vec::new();
+
+    for (idx, ev) in events.iter().enumerate() {
+        for item in &ev.items {
+            match item {
+                Item::Thinking(t) => {
+                    let tokens = estimate_tokens(t);
+                    if tokens > THINKING_THRESHOLD {
+                        findings.push(Finding {
+                            rule: "huge-thinking",
+                            event_idx: idx,
+                            event_id: ev.id.clone(),
+                            detail: format!("thinking block of ~{tokens} tok — condense or drop"),
+                            tokens,
+                        });
+                    }
+                }
+                Item::ToolCall { call_id, desc, targets } => {
+                    call_desc.insert(call_id.clone(), desc.clone());
+                    for (action, path) in targets {
+                        ops.push(Op {
+                            idx,
+                            id: ev.id.clone(),
+                            call_id: call_id.clone(),
+                            action: *action,
+                            path: path.clone(),
+                        });
+                    }
+                }
+                Item::ToolResult { call_id, tokens } => {
+                    result_tokens.insert(call_id.clone(), *tokens);
+                    results.push((idx, ev.id.clone(), call_id.clone()));
+                }
+                Item::Text(_) => {}
+            }
+        }
+    }
+
+    // A read is dead weight if the same path is re-read later (superseded)
+    // or edited later (stale). Reads after the last mutation are fresh.
+    let mut flagged: HashSet<&str> = HashSet::new();
+    for (i, op) in ops.iter().enumerate() {
+        if op.action != Action::Read {
+            continue;
+        }
+        let later_read = ops[i + 1..]
+            .iter()
+            .find(|o| o.path == op.path && o.action == Action::Read && o.call_id != op.call_id);
+        let later_mutate = ops[i + 1..].iter().find(|o| o.path == op.path && o.action == Action::Mutate);
+        let tokens = result_tokens.get(&op.call_id).copied().unwrap_or(0);
+        if let Some(r) = later_read {
+            findings.push(Finding {
+                rule: "superseded-read",
+                event_idx: op.idx,
+                event_id: op.id.clone(),
+                detail: format!("{} re-read at #{} — this earlier copy is dead weight", op.path, r.idx),
+                tokens,
+            });
+            flagged.insert(&op.call_id);
+        } else if let Some(m) = later_mutate {
+            findings.push(Finding {
+                rule: "stale-read",
+                event_idx: op.idx,
+                event_id: op.id.clone(),
+                detail: format!("{} edited at #{} — this read no longer matches disk", op.path, m.idx),
+                tokens,
+            });
+            flagged.insert(&op.call_id);
+        }
+    }
+
+    for (idx, id, call_id) in &results {
+        let tokens = result_tokens.get(call_id).copied().unwrap_or(0);
+        if tokens > OUTPUT_THRESHOLD && !flagged.contains(call_id.as_str()) {
+            let desc = call_desc.get(call_id).cloned().unwrap_or_else(|| "tool".into());
+            findings.push(Finding {
+                rule: "huge-output",
+                event_idx: *idx,
+                event_id: id.clone(),
+                detail: format!("{desc} returned ~{tokens} tok — trim or summarize"),
+                tokens,
+            });
+        }
+    }
+
+    findings.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+    findings
+}
+
+// ---------- report ----------
+
+#[derive(Serialize, Clone)]
+pub(crate) struct Semantic {
+    pub contradiction: String,
+    pub bloating: String,
+    pub model_used: String,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct Summary {
+    pub total_events: usize,
+    pub session_tokens: usize,
+    pub findings: usize,
+    pub reclaimable_tokens: usize,
+    pub reclaimable_pct: usize,
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct Report {
+    pub version: u8,
+    pub session: String,
+    pub findings: Vec<Finding>,
+    pub semantic: Option<Semantic>,
+    pub summary: Summary,
+}
+
+pub(crate) fn build_report(session: String, events: &[Event], semantic: Option<Semantic>) -> Report {
+    let findings = analyze(events);
+    let session_tokens: usize = events
+        .iter()
+        .flat_map(|e| &e.items)
+        .map(|i| match i {
+            Item::Text(t) | Item::Thinking(t) => estimate_tokens(t),
+            Item::ToolResult { tokens, .. } => *tokens,
+            Item::ToolCall { .. } => 0,
+        })
+        .sum();
+    let reclaimable: usize = findings.iter().map(|f| f.tokens).sum();
+    Report {
+        version: REPORT_VERSION,
+        session,
+        summary: Summary {
+            total_events: events.len(),
+            session_tokens,
+            findings: findings.len(),
+            reclaimable_tokens: reclaimable,
+            reclaimable_pct: reclaimable * 100 / session_tokens.max(1),
+        },
+        findings,
+        semantic,
+    }
+}
+
+pub(crate) fn semantic(events: &[Event]) -> Result<Semantic> {
+    let mut digest = String::new();
+    for ev in events {
+        for item in &ev.items {
+            match item {
+                Item::Text(t) => digest.push_str(&format!("\n--- {} ---\n{}\n", ev.role, t)),
+                Item::Thinking(t) => digest.push_str(&format!("\n--- thinking ---\n{}\n", t)),
+                _ => {}
+            }
+        }
+    }
+    let digest = cap_middle(digest, SEMANTIC_DIGEST_CAP);
+    let prompt = format!(
+        "Analyze the conversation for context rot. Find CONTRADICTIONS and BLOATING. Be specific.\n\nCONTRADICTIONS:\n- <list>\n\nBLOATING:\n- <list>\n\nConversation:\n{digest}"
+    );
+    llm_sections(&prompt)
+}
+
+pub(crate) fn cap_middle(s: String, cap: usize) -> String {
+    if s.len() <= cap {
+        return s;
+    }
+    let cut = |at: usize| {
+        let mut i = at.min(s.len());
+        while !s.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    format!(
+        "{}\n[... middle truncated ...]\n{}",
+        &s[..cut(cap / 2)],
+        &s[cut(s.len() - cap / 2)..]
+    )
+}
+
+pub(crate) fn llm_sections(prompt: &str) -> Result<Semantic> {
+    let sh = std::process::Command::new("pi")
+        .args(["-p", prompt, "--model", SEMANTIC_MODEL])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&sh.stdout);
+    let (contradiction, bloating) = parse_semantic_sections(&stdout);
+    Ok(Semantic { contradiction, bloating, model_used: SEMANTIC_MODEL.into() })
+}
+
+fn parse_semantic_sections(output: &str) -> (String, String) {
+    // A heading is a short non-bullet line naming the section; bullets under the
+    // current heading are collected, blank lines and prose are skipped.
+    let heading_of = |t: &str| -> Option<usize> {
+        if t.len() >= 60 || t.starts_with("- ") || t.starts_with("* ") {
+            return None;
+        }
+        let u = t.to_uppercase();
+        if u.contains("CONTRADICTION") {
+            Some(0)
+        } else if ["BLOAT", "DUPLICATION", "REDUNDAN"].iter().any(|k| u.contains(k)) {
+            Some(1)
+        } else {
+            None
+        }
+    };
+    let mut sections = [String::new(), String::new()];
+    let mut cur: Option<usize> = None;
+    for line in output.lines() {
+        let t = line.trim();
+        if let Some(i) = heading_of(t) {
+            cur = Some(i);
+            continue;
+        }
+        if let Some(i) = cur {
+            if t.starts_with("- ") || t.starts_with("* ") {
+                let body = t.trim_start_matches(['-', '*']).trim();
+                sections[i].push_str(&format!("- {body}\n"));
+            }
+        }
+    }
+    let done = |s: String| if s.is_empty() { "(no findings)".to_string() } else { s.trim_end().to_string() };
+    let [c, b] = sections;
+    (done(c), done(b))
+}
+
+// ---------- output ----------
+
+pub(crate) fn tok_fmt(n: usize) -> String {
+    if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
+}
+
+pub(crate) fn ago(t: SystemTime) -> String {
+    let secs = SystemTime::now().duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
+    match secs {
+        0..=59 => format!("{}s", secs.max(1)),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+pub(crate) fn size_fmt(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{}K", n / 1000)
+    } else {
+        format!("{n}B")
+    }
+}
+
+pub(crate) fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.into()
+    } else {
+        format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>())
+    }
+}
+
+fn human(r: &Report) {
+    let s = &r.summary;
+    println!("cxwatch — {}", r.session);
+    println!(
+        "  events {} · session ≈{} tok · {} findings · ≈{} tok reclaimable ({}%)",
+        s.total_events,
+        tok_fmt(s.session_tokens),
+        s.findings,
+        tok_fmt(s.reclaimable_tokens),
+        s.reclaimable_pct
+    );
+    for f in &r.findings {
+        println!("  {:<16} {:>8}  #{:<5} {}", f.rule, format!("~{}", tok_fmt(f.tokens)), f.event_idx, f.detail);
+    }
+    if let Some(sem) = &r.semantic {
+        println!("  semantic ({}):", sem.model_used);
+        println!("    contradictions:\n      {}", sem.contradiction.replace('\n', "\n      "));
+        println!("    bloating:\n      {}", sem.bloating.replace('\n', "\n      "));
+    }
+}
+
+pub(crate) fn markdown(r: &Report) -> String {
+    let s = &r.summary;
+    let mut md = format!(
+        "# cxwatch report\n\n- Session: `{}`\n- Events: {}\n- Session size: ~{} tok\n- Findings: {}\n- Reclaimable: ~{} tok ({}%)\n\n## Findings\n\n",
+        r.session,
+        s.total_events,
+        tok_fmt(s.session_tokens),
+        s.findings,
+        tok_fmt(s.reclaimable_tokens),
+        s.reclaimable_pct
+    );
+    if r.findings.is_empty() {
+        md.push_str("No mechanical rot detected.\n");
+    }
+    for f in &r.findings {
+        md.push_str(&format!(
+            "- **{}** (#{}): {} — ~{} tok\n",
+            f.rule,
+            f.event_idx,
+            f.detail,
+            tok_fmt(f.tokens)
+        ));
+    }
+    if let Some(sem) = &r.semantic {
+        md.push_str(&format!(
+            "\n## Semantic ({})\n\n### Contradictions\n{}\n\n### Bloating\n{}\n",
+            sem.model_used, sem.contradiction, sem.bloating
+        ));
+    }
+    md
+}
+
+// ---------- subcommands ----------
+
+fn load(session: Option<PathBuf>, want_semantic: bool) -> Result<Report> {
+    let path = match session {
+        Some(p) => p,
+        None => latest_session()?,
+    };
+    let events = parse(&path)?;
+    let semantic = want_semantic.then(|| {
+        semantic(&events).unwrap_or_else(|e| Semantic {
+            contradiction: format!("semantic unavailable: {e}"),
+            bloating: String::new(),
+            model_used: SEMANTIC_MODEL.into(),
+        })
+    });
+    Ok(build_report(path.display().to_string(), &events, semantic))
+}
+
+fn report_cmd(session: Option<PathBuf>, json: bool, want_semantic: bool) -> Result<()> {
+    let r = load(session, want_semantic)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+    } else {
+        human(&r);
+    }
+    Ok(())
+}
+
+fn explain_cmd(session: Option<PathBuf>, output: Option<String>) -> Result<()> {
+    let r = load(session, true)?;
+    let out = output.unwrap_or_else(|| "cxwatch-demo.md".into());
+    std::fs::write(&out, markdown(&r))?;
+    println!("wrote {out}");
+    Ok(())
+}
+
+fn sessions_cmd() -> Result<()> {
+    for (i, s) in sessions().iter().enumerate() {
+        println!(
+            "[{:>4}] {:<7} {:>4} {:>7}  {:<40}  {}",
+            i + 1,
+            s.source.label(),
+            ago(s.modified),
+            size_fmt(s.size),
+            clip(&s.title, 40),
+            s.path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pi_call(id: &str, call_id: &str, name: &str, args: Value) -> Event {
+        parse_line(&json!({"type":"message","id":id,"message":{"role":"assistant","content":[
+            {"type":"toolCall","id":call_id,"name":name,"arguments":args}]}}))
+        .unwrap()
+    }
+
+    fn pi_result(call_id: &str, text: &str) -> Event {
+        parse_line(&json!({"type":"message","id":"r","message":{"role":"toolResult",
+            "toolCallId":call_id,"content":[{"type":"text","text":text}]}}))
+        .unwrap()
+    }
+
+    #[test]
+    fn stale_read_flags_the_earlier_read() {
+        let events = vec![
+            pi_call("a", "c1", "read", json!({"path":"/x"})),
+            pi_result("c1", &"y".repeat(400)),
+            pi_call("b", "c2", "edit", json!({"path":"/x"})),
+        ];
+        let f = analyze(&events);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "stale-read");
+        assert_eq!(f[0].event_idx, 0);
+        assert_eq!(f[0].tokens, 100); // from the tool result, not the call
+    }
+
+    #[test]
+    fn read_after_edit_is_fresh() {
+        let events = vec![
+            pi_call("a", "c1", "edit", json!({"path":"/x"})),
+            pi_call("b", "c2", "read", json!({"path":"/x"})),
+        ];
+        assert!(analyze(&events).is_empty());
+    }
+
+    #[test]
+    fn superseded_read_flags_the_earlier_copy() {
+        let events = vec![
+            pi_call("a", "c1", "read", json!({"path":"/f"})),
+            pi_result("c1", &"y".repeat(80)),
+            pi_call("b", "c2", "read", json!({"path":"/f"})),
+        ];
+        let f = analyze(&events);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "superseded-read");
+        assert_eq!(f[0].event_idx, 0);
+        assert_eq!(f[0].tokens, 20);
+    }
+
+    #[test]
+    fn huge_thinking() {
+        let ev = parse_line(&json!({"type":"message","id":"t","message":{"role":"assistant",
+            "content":[{"type":"thinking","thinking":"x".repeat(8200)}]}}))
+        .unwrap();
+        let f = analyze(&[ev]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "huge-thinking");
+    }
+
+    #[test]
+    fn huge_output() {
+        let events = vec![
+            pi_call("a", "c1", "bash", json!({"command":"ls -la"})),
+            pi_result("c1", &"y".repeat(20_000)),
+        ];
+        let f = analyze(&events);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "huge-output");
+        assert_eq!(f[0].tokens, 5000);
+    }
+
+    #[test]
+    fn claude_format_parses_tool_use_and_result() {
+        let call = parse_line(&json!({"type":"assistant","uuid":"u1","message":{"role":"assistant",
+            "content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/a.rs"}}]}}))
+        .unwrap();
+        let result = parse_line(&json!({"type":"user","uuid":"u2","message":{"role":"user",
+            "content":[{"type":"tool_result","tool_use_id":"t1","content":"z".repeat(400)}]}}))
+        .unwrap();
+        let edit = parse_line(&json!({"type":"assistant","uuid":"u3","message":{"role":"assistant",
+            "content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"/a.rs"}}]}}))
+        .unwrap();
+        let f = analyze(&[call, result, edit]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "stale-read");
+        assert_eq!(f[0].tokens, 100);
+    }
+
+    #[test]
+    fn codex_function_call_string_args() {
+        let ev = parse_line(&json!({"type":"response_item","payload":{"type":"function_call",
+            "name":"exec_command","call_id":"c9",
+            "arguments":"{\"cmd\":\"ls && sed -n '1,240p' plan.md\"}"}}))
+        .unwrap();
+        let Item::ToolCall { targets, .. } = &ev.items[0] else { panic!("expected tool call") };
+        assert_eq!(targets, &[(Action::Read, "plan.md".to_string())]);
+    }
+
+    #[test]
+    fn semantic_sections_survive_llm_formatting() {
+        let out = "Here is my analysis.\n\n### CONTRADICTIONS\n\n- A says tabs, B says spaces\n\nSome prose.\n\n**Duplication:**\n\n- C and D both say run tests\n- E repeats C\n";
+        let (c, b) = parse_semantic_sections(out);
+        assert_eq!(c, "- A says tabs, B says spaces");
+        assert_eq!(b, "- C and D both say run tests\n- E repeats C");
+        let (c2, b2) = parse_semantic_sections("nothing structured at all");
+        assert_eq!(c2, "(no findings)");
+        assert_eq!(b2, "(no findings)");
+    }
+
+    #[test]
+    fn shell_reader_extraction() {
+        assert_eq!(shell_read_targets("cat /tmp/foo"), vec![(Action::Read, "/tmp/foo".into())]);
+        assert_eq!(
+            shell_read_targets("ls | head -n 50 src/main.rs"),
+            vec![(Action::Read, "src/main.rs".into())]
+        );
+        assert!(shell_read_targets("sed -i 's/a/b/' f.txt").is_empty());
+    }
+}
