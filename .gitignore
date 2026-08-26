@@ -1,0 +1,5 @@
+/target
+
+# generated reports (contain machine-local paths and session data)
+cxwatch-*.md
+prune-plan.md
