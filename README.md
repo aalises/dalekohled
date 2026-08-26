@@ -33,6 +33,8 @@ cxwatch report path/to/run.jsonl  # Audit one session file
 cxwatch estate                    # Audit static agent configuration
 cxwatch estate -o cleanup.md      # Write a cleanup report
 cxwatch estate --json             # Return machine-readable output
+cxwatch estate --fix              # Apply mechanical fixes interactively
+cxwatch status                    # One-line rot-o-meter for the latest session
 ```
 
 ## Install
@@ -87,6 +89,46 @@ The estate audit compares configured context with observed use in local transcri
 
 The cleanup report groups findings by action. Each item includes a path, evidence, and a proposed fix. Review all deletion and configuration changes before you apply them.
 
+## Apply fixes
+
+Some findings have a mechanical fix: repair a memory index, delete an unused command or skill, remove an unused MCP server. `cxwatch` can apply these for you:
+
+```bash
+cxwatch estate --fix        # Confirm each fix: y, n, a (all), or q (quit)
+cxwatch estate --fix --yes  # Apply all mechanical fixes without prompts
+```
+
+In the interactive estate view, press `F` once to see the fix and press `F` again to apply it.
+
+Before any change, `cxwatch` copies the affected file to `~/.cache/cxwatch/trash`. Deleted files and directories move there instead of being removed. Findings without a mechanical fix stay report-only; use the cleanup report for those.
+
+## Rot-o-meter
+
+`cxwatch status` prints a one-line summary of the most recent session across all agents:
+
+```
+[codex] rot  62% ██████░░░░ ~135.8k tok reclaimable · 47 findings
+```
+
+Results are cached by session size, so repeated calls return in milliseconds. Use it anywhere that shows a line of text:
+
+- **Claude Code statusline** — add to `~/.claude/settings.json`:
+
+  ```json
+  { "statusLine": { "type": "command", "command": "cxwatch statusline" } }
+  ```
+
+  `cxwatch statusline` reads the statusline JSON on stdin and reports the rot of the *current* session. If you already have a statusline script, append `cxwatch statusline` output to it.
+
+- **tmux** — works for every agent running in the terminal:
+
+  ```
+  set -g status-right '#(cxwatch status)'
+  set -g status-interval 15
+  ```
+
+- **Codex** — point `notify` in `~/.codex/config.toml` at a script that runs `cxwatch status` and raises a notification above your threshold.
+
 ## Supported agents
 
 | Agent | Session source | Static context source |
@@ -125,6 +167,7 @@ Report and estate views:
 
 - Use `Up` and `Down` to scroll.
 - Press `Enter` to show the proposed fix for an estate finding.
+- Press `F` twice to apply a mechanical fix (first press shows what will change).
 - Press `E` to export a Markdown report.
 - Press `Esc` to return to the picker.
 - Press `Q` to exit.
