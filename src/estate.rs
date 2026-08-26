@@ -9,6 +9,7 @@ use std::time::SystemTime;
 const GRACE_DAYS: u64 = 14;
 const STALE_DAYS: u64 = 120;
 const HOOK_TAX_MIN_TOKENS: usize = 500;
+const HEAVY_BLOCK_TOKENS: usize = 400;
 
 #[derive(Serialize, Clone)]
 pub(crate) struct EstateFinding {
@@ -36,9 +37,18 @@ pub(crate) struct EstateSummary {
 }
 
 #[derive(Serialize, Clone)]
+pub(crate) struct Block {
+    pub file: String,
+    pub heading: String,
+    pub tokens: usize,
+}
+
+#[derive(Serialize, Clone)]
 pub(crate) struct EstateReport {
     pub version: u8,
     pub findings: Vec<EstateFinding>,
+    /// Always-loaded instruction files priced per heading block.
+    pub blocks: Vec<Block>,
     /// Positive usage counts, for JSON consumers and the semantic digest.
     pub usage: Vec<String>,
     pub semantic: Option<Semantic>,
@@ -238,11 +248,12 @@ pub(crate) fn audit() -> EstateReport {
                         "confirm with the user, then `rm -r {}`; if the guidance is still wanted, move the key lines into a doc that is read on demand instead of an always-listed skill",
                         f.parent().unwrap_or(&f).display()
                     ),
-                    tokens: md.len() as usize / 4,
+                    tokens: crate::estimate_tokens(&std::fs::read_to_string(&f).unwrap_or_default()),
                     uses: 0,
                     detail: format!(
-                        "never invoked across {} claude sessions; its description is loaded every session{reads_note}",
-                        usage.claude_sessions
+                        "never invoked across {} claude sessions; its description is loaded every session{reads_note}{}",
+                        usage.claude_sessions,
+                        git_note(&f)
                     ),
                     action: "delete or demote",
                 });
@@ -283,9 +294,13 @@ pub(crate) fn audit() -> EstateReport {
                     unit: format!("command /{name}"),
                     path: p.display().to_string(),
                     fix: format!("confirm with the user, then `rm {}`", p.display()),
-                    tokens: md.len() as usize / 4,
+                    tokens: crate::estimate_tokens(&std::fs::read_to_string(&p).unwrap_or_default()),
                     uses: 0,
-                    detail: format!("never invoked across {} claude sessions", usage.claude_sessions),
+                    detail: format!(
+                        "never invoked across {} claude sessions{}",
+                        usage.claude_sessions,
+                        git_note(&p)
+                    ),
                     action: "delete",
                 });
             }
@@ -385,7 +400,6 @@ pub(crate) fn audit() -> EstateReport {
                     units += 1;
                     on_disk.insert(fname.clone());
                     let md = p.metadata().ok();
-                    let size = md.as_ref().map(|m| m.len()).unwrap_or(0) as usize;
                     if age_days(now, md.and_then(|m| m.modified().ok())) > STALE_DAYS {
                         stale += 1;
                     }
@@ -405,7 +419,7 @@ pub(crate) fn audit() -> EstateReport {
                                 mem.join("MEMORY.md").display(),
                                 fname.trim_end_matches(".md")
                             ),
-                            tokens: size / 4,
+                            tokens: crate::estimate_tokens(&body),
                             uses: 0,
                             detail: "on disk but missing from MEMORY.md index — never loaded".into(),
                             action: "repair index",
@@ -422,7 +436,7 @@ pub(crate) fn audit() -> EstateReport {
                                 p.display(),
                                 missing.join(", ")
                             ),
-                            tokens: size / 4,
+                            tokens: crate::estimate_tokens(&body),
                             uses: 0,
                             detail: format!("references missing path(s): {}", missing.join(", ")),
                             action: "update memory",
@@ -490,12 +504,19 @@ pub(crate) fn audit() -> EstateReport {
             }
         }
     }
+    // always-loaded instruction files: stale refs + per-block pricing
+    let mut blocks: Vec<Block> = Vec::new();
     for (label, rel, body) in [
         ("CLAUDE.md", ".claude/CLAUDE.md", claude_md),
         (
             "codex AGENTS.md",
             ".codex/AGENTS.md",
             std::fs::read_to_string(home.join(".codex/AGENTS.md")).unwrap_or_default(),
+        ),
+        (
+            "opencode AGENTS.md",
+            ".config/opencode/AGENTS.md",
+            std::fs::read_to_string(home.join(".config/opencode/AGENTS.md")).unwrap_or_default(),
         ),
     ] {
         let missing = missing_paths(&body);
@@ -509,13 +530,33 @@ pub(crate) fn audit() -> EstateReport {
                     home.join(rel).display(),
                     missing.join(", ")
                 ),
-                tokens: body.len() / 4,
+                tokens: crate::estimate_tokens(&body),
                 uses: 0,
                 detail: format!("references missing path(s): {}", missing.join(", ")),
                 action: "update instructions",
             });
         }
+        for b in price_blocks(label, &body) {
+            if b.tokens > HEAVY_BLOCK_TOKENS {
+                findings.push(EstateFinding {
+                    rule: "heavy-block",
+                    unit: format!("{} § {}", b.file, b.heading),
+                    path: home.join(rel).display().to_string(),
+                    fix: format!(
+                        "tighten the `{}` block in {} or move it into an on-demand skill/doc",
+                        b.heading,
+                        home.join(rel).display()
+                    ),
+                    tokens: b.tokens,
+                    uses: 0,
+                    detail: format!("~{} tok paid on every request of every session", tok_fmt(b.tokens)),
+                    action: "tighten",
+                });
+            }
+            blocks.push(b);
+        }
     }
+    blocks.sort_by(|a, b| b.tokens.cmp(&a.tokens));
 
     // hook tax: payloads observed injected into transcripts
     for (name, stat) in &usage.hooks {
@@ -575,6 +616,7 @@ pub(crate) fn audit() -> EstateReport {
             tokens_flagged,
         },
         findings,
+        blocks,
         usage: used,
         semantic: None,
     };
@@ -615,7 +657,7 @@ fn push_harness_skill(
             unit: format!("skill {harness}:{name}"),
             path: skill_md.display().to_string(),
             fix,
-            tokens: md.len() as usize / 4,
+            tokens: crate::estimate_tokens(&std::fs::read_to_string(skill_md).unwrap_or_default()),
             uses: 0,
             detail: format!("never read across {sessions} {harness} sessions"),
             action: "remove",
@@ -672,10 +714,62 @@ fn pi_skill_files(npm: &Path) -> Vec<PathBuf> {
 }
 
 fn rank(rule: &str) -> usize {
-    ["dead-mcp", "dead-skill", "duplicate-directive", "hook-tax", "dead-command", "orphan-memory", "dangling-index", "stale-ref", "stale-memory"]
-        .iter()
-        .position(|r| *r == rule)
-        .unwrap_or(99)
+    GROUPS.iter().position(|(r, _)| *r == rule).unwrap_or(99)
+}
+
+/// (days since last commit, commit count) for files tracked in a git repo.
+fn git_stats(path: &Path) -> Option<(u64, usize)> {
+    let dir = path.parent()?;
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["log", "--format=%ct", "--"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let commits: Vec<u64> = stdout.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    let last = *commits.first()?;
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    Some((now.saturating_sub(last) / 86_400, commits.len()))
+}
+
+fn git_note(path: &Path) -> String {
+    match git_stats(path) {
+        Some((age, commits)) => format!("; git: {commits} commit{}, last change {age}d ago", if commits == 1 { "" } else { "s" }),
+        None => String::new(),
+    }
+}
+
+/// Split an instruction file into heading-delimited blocks, priced in real tokens.
+fn price_blocks(file: &str, text: &str) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut heading = "(preamble)".to_string();
+    let mut buf = String::new();
+    let flush = |heading: &str, buf: &mut String, out: &mut Vec<Block>| {
+        if !buf.trim().is_empty() {
+            out.push(Block {
+                file: file.to_string(),
+                heading: heading.to_string(),
+                tokens: crate::estimate_tokens(buf),
+            });
+        }
+        buf.clear();
+    };
+    for line in text.lines() {
+        if line.starts_with('#') {
+            flush(&heading, &mut buf, &mut out);
+            heading = line.trim_start_matches('#').trim().to_string();
+        } else {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+    flush(&heading, &mut buf, &mut out);
+    out
 }
 
 fn age_days(now: SystemTime, modified: Option<SystemTime>) -> u64 {
@@ -822,10 +916,11 @@ pub(crate) fn human(r: &EstateReport) {
     }
 }
 
-pub(crate) const GROUPS: [(&str, &str); 9] = [
+pub(crate) const GROUPS: [(&str, &str); 10] = [
     ("dead-mcp", "Disable unused MCP servers"),
     ("dead-skill", "Delete or demote dead skills"),
     ("duplicate-directive", "Merge duplicated directives"),
+    ("heavy-block", "Tighten heavy instruction blocks"),
     ("hook-tax", "Slim hook payloads"),
     ("dead-command", "Delete unused commands"),
     ("orphan-memory", "Repair memory indexes — orphaned files"),
@@ -867,6 +962,13 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
                 "- [ ] **{}**{tok_note} — {}\n      - why: {}\n      - file: `{}`\n",
                 f.unit, f.fix, f.detail, f.path
             ));
+        }
+        md.push('\n');
+    }
+    if !r.blocks.is_empty() {
+        md.push_str("## Always-loaded instruction blocks (priced per heading)\n\n| file | block | tokens |\n|---|---|---|\n");
+        for b in &r.blocks {
+            md.push_str(&format!("| {} | {} | ~{} |\n", b.file, b.heading, tok_fmt(b.tokens)));
         }
         md.push('\n');
     }
@@ -967,6 +1069,25 @@ mod tests {
     fn index_link_extraction() {
         let idx = "# Notes\n- [A](a.md) — hook\n- [B](b.md)\n- [ext](https://x.com/y.md)\n";
         assert_eq!(index_links(idx), vec!["a.md".to_string(), "b.md".to_string()]);
+    }
+
+    #[test]
+    fn blocks_priced_per_heading() {
+        let text = "intro line\n\n# Setup\nrun the thing\n\n## Rules\nalways test\nnever push\n";
+        let blocks = price_blocks("X.md", text);
+        let headings: Vec<&str> = blocks.iter().map(|b| b.heading.as_str()).collect();
+        assert_eq!(headings, vec!["(preamble)", "Setup", "Rules"]);
+        assert!(blocks.iter().all(|b| b.tokens > 0));
+    }
+
+    #[test]
+    fn git_stats_on_tracked_file() {
+        // this repo's own Cargo.toml is committed, so stats must resolve
+        let (age, commits) = git_stats(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml").as_path())
+            .expect("tracked file");
+        assert!(commits >= 1);
+        assert!(age < 36_500);
+        assert!(git_stats(Path::new("/tmp/definitely-not-in-git.xyz")).is_none());
     }
 
     #[test]
