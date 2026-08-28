@@ -107,7 +107,7 @@ Sleep 4s
 
 # ── outro card ──
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — a linter for your coding agents\n\n   \033[1mgithub.com/aalises/dalekohled\033[0m\n\n   cargo install --git https://github.com/aalises/dalekohled\n\n   \033[2mMIT · session audit + config audit + autofix\033[0m\n'`
+Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — a linter for your coding agents\n\n   \033[1mgithub.com/n8n-io/dalekohded\033[0m\n\n   cargo install --git https://github.com/n8n-io/dalekohded\n\n   \033[2mMIT · session audit + config audit + autofix\033[0m\n'`
 Enter
 Show
 Sleep 4.5s

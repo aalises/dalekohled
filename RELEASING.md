@@ -13,13 +13,13 @@ Everything below is done. Going public is: **Settings → make repository public
   artifact, all attached to the (currently private) release. The moment the repo is public:
 
   ```bash
-  curl -fsSL https://github.com/aalises/dalekohled/releases/latest/download/cxwatch-installer.sh | sh
+  curl -fsSL https://github.com/n8n-io/dalekohded/releases/latest/download/cxwatch-installer.sh | sh
   ```
 
 ## Still manual at launch (optional, ~10 min each)
 
-- **Homebrew tap** (`brew install aalises/tap/cxwatch`): create public repo `aalises/homebrew-tap`,
-  add under `[dist]` in `dist-workspace.toml`: `tap = "aalises/homebrew-tap"` and
+- **Homebrew tap** (`brew install n8n-io/tap/cxwatch`): create public repo `n8n-io/homebrew-tap`,
+  add under `[dist]` in `dist-workspace.toml`: `tap = "n8n-io/homebrew-tap"` and
   `publish-jobs = ["homebrew"]`, add a `HOMEBREW_TAP_TOKEN` repo secret (PAT with write access to
   the tap), re-tag.
 - **npm** (`npx cxwatch`): reserve the package name, add `NPM_TOKEN` secret and
@@ -39,7 +39,7 @@ The dist workflow builds every target and attaches all artifacts to the GitHub r
 ## Private beta installs (while the repo is private)
 
 ```bash
-gh release download v0.1.0 -R aalises/dalekohled -p '*aarch64-apple-darwin*' -O - | tar -xz
+gh release download v0.1.0 -R n8n-io/dalekohded -p '*aarch64-apple-darwin*' -O - | tar -xz
 # or
-cargo install --git https://github.com/aalises/dalekohled
+cargo install --git https://github.com/n8n-io/dalekohded
 ```

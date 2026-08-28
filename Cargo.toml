@@ -5,8 +5,8 @@ edition = "2024"
 rust-version = "1.88"
 description = "Audit stale session context and unused configuration for AI coding agents"
 license = "MIT"
-repository = "https://github.com/aalises/dalekohled"
-homepage = "https://github.com/aalises/dalekohled"
+repository = "https://github.com/n8n-io/dalekohded"
+homepage = "https://github.com/n8n-io/dalekohded"
 readme = "README.md"
 exclude = [".github", "demo.mp4", "demo.tape"]
 
