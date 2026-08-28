@@ -1,6 +1,6 @@
 # cxwatch demo — render with: vhs demo.tape
-# Fully self-contained: builds a synthetic $HOME (demo/fixtures.py) first,
-# so the recording never shows real session data.
+# Fully self-contained: builds the release binary and a synthetic $HOME
+# (demo/fixtures.py) first, so the recording never shows real session data.
 
 Output demo.gif
 Output demo.mp4
@@ -13,9 +13,9 @@ Set Height 1350
 Set Padding 32
 Set TypingSpeed 75ms
 
-# ── setup: staged home with synthetic sessions (hidden) ──
+# ── setup: fresh build + staged home with synthetic sessions (hidden) ──
 Hide
-Type "python3 demo/fixtures.py >/dev/null 2>&1 && export HOME=/tmp/cxwatch-demo-home && clear"
+Type `cargo build --release >/dev/null 2>&1 && export PATH="$PWD/target/release:$PATH" && python3 demo/fixtures.py >/dev/null 2>&1 && export HOME=/tmp/cxwatch-demo-home && clear`
 Enter
 Show
 
@@ -26,9 +26,9 @@ Enter
 Show
 Sleep 4s
 
-# ── ① the picker ──
+# ── ① see every session ──
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;33m①  PICK A SESSION\033[0m\n\n   every harness on your machine, one picker —\n   type to filter, badges per agent, live prompt previews\n'`
+Type `clear && printf '\n\n\n\n   \033[1;33m①  SEE EVERY SESSION\033[0m\n\n   every harness on your machine, one list —\n   newest first, sized, with the source agent\n'`
 Enter
 Show
 Sleep 3s
@@ -36,47 +36,59 @@ Hide
 Type "clear"
 Enter
 Show
-Type "cxwatch"
+Type "cxwatch sessions"
 Sleep 600ms
-Enter
-Sleep 3s
-Type "opencode"
-Sleep 2.2s
-Escape
-Sleep 800ms
-
-# ── ② the rot report ──
-Type "0198beef"
-Sleep 1.5s
 Enter
 Sleep 4.5s
-Escape
-Sleep 600ms
-Escape
-Sleep 500ms
 
-# ── ③ the config audit ──
-Ctrl+E
-Sleep 5s
-Down@250ms 2
-Sleep 1.2s
-Enter
-Sleep 2.5s
-Type "f"
-Sleep 3s
-Type "e"
-Sleep 2s
-Type "q"
-Sleep 500ms
+# ── ② audit a session ──
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;33m③  THE ESTATE AUDIT\033[0m\n\n   what you just saw: skills nobody invokes, MCP servers nobody calls,\n   broken memory indexes, oversized instruction blocks —\n   joined against real usage from your transcripts.\n\n   \033[32mpress f twice to apply a fix — every change backed up first\033[0m\n'`
+Type `clear && printf '\n\n\n\n   \033[1;33m②  AUDIT A SESSION\033[0m\n\n   point cxwatch at any transcript — stale reads, superseded copies,\n   oversized thinking and output, each priced in tokens\n'`
 Enter
 Show
-Sleep 4s
-
-# ── ④ hand it to an agent ──
+Sleep 3s
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;33m④  HAND IT TO AN AGENT\033[0m\n\n   export an executable cleanup plan — checklists, exact commands,\n   file paths and evidence. paste it into any coding agent.\n'`
+Type "clear"
+Enter
+Show
+Type "cxwatch audit ~/.claude/projects/-Users-demo-dev-acmeshop/*.jsonl"
+Sleep 600ms
+Enter
+Sleep 5s
+
+# ── ③ audit your config ──
+Hide
+Type `clear && printf '\n\n\n\n   \033[1;33m③  AUDIT YOUR CONFIG\033[0m\n\n   skills nobody invokes, MCP servers nobody calls, broken memory\n   indexes, oversized instruction blocks — joined against\n   real usage from your transcripts\n'`
+Enter
+Show
+Sleep 3s
+Hide
+Type "clear"
+Enter
+Show
+Type "cxwatch audit"
+Sleep 600ms
+Enter
+Sleep 6s
+
+# ── ④ autofix ──
+Hide
+Type `clear && printf '\n\n\n\n   \033[1;33m④  AUTOFIX\033[0m\n\n   mechanical fixes applied for you —\n   \033[32mevery change backed up to the cxwatch trash first\033[0m\n'`
+Enter
+Show
+Sleep 3s
+Hide
+Type "clear"
+Enter
+Show
+Type "cxwatch audit --fix --yes"
+Sleep 600ms
+Enter
+Sleep 7s
+
+# ── ⑤ hand it to an agent ──
+Hide
+Type `clear && printf '\n\n\n\n   \033[1;33m⑤  HAND IT TO AN AGENT\033[0m\n\n   export an executable cleanup plan — checklists, exact commands,\n   file paths and evidence. paste it into any coding agent.\n'`
 Enter
 Show
 Sleep 3s
@@ -93,30 +105,9 @@ Sleep 600ms
 Enter
 Sleep 4s
 
-# ── ⑤ the rot-o-meter ──
-Hide
-Type `clear && printf '\n\n\n\n   \033[1;33m⑤  THE ROT-O-METER\033[0m\n\n   a live rot score for any harness —\n   Claude Code statusline, tmux status bar, shell prompt\n'`
-Enter
-Show
-Sleep 3s
-Hide
-Type "clear"
-Enter
-Show
-Type "cxwatch status ~/.codex/sessions/2026/08/20/rollout-*.jsonl"
-Sleep 500ms
-Enter
-Type "cxwatch status ~/.claude/projects/-Users-demo-dev-acmeapi/*.jsonl"
-Sleep 500ms
-Enter
-Type "cxwatch status"
-Sleep 500ms
-Enter
-Sleep 4.5s
-
 # ── outro card ──
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — a linter for your coding agents\n\n   \033[1mgithub.com/aalises/dalekohled\033[0m\n\n   cargo install --git https://github.com/aalises/dalekohled\n\n   \033[2mMIT · sessions + config audit + autofix + rot-o-meter\033[0m\n'`
+Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — a linter for your coding agents\n\n   \033[1mgithub.com/aalises/dalekohled\033[0m\n\n   cargo install --git https://github.com/aalises/dalekohled\n\n   \033[2mMIT · session audit + config audit + autofix\033[0m\n'`
 Enter
 Show
 Sleep 4.5s

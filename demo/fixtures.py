@@ -3,11 +3,11 @@
 
 Usage:
     python3 demo/fixtures.py [target-home]   # default /tmp/cxwatch-demo-home
-    HOME=/tmp/cxwatch-demo-home cxwatch      # or: vhs demo.tape
+    HOME=/tmp/cxwatch-demo-home cxwatch audit  # or: vhs demo.tape
 
 The data is entirely synthetic ("acmeshop" project) but shaped exactly like
 real Claude Code / Codex / pi / OpenCode transcripts, and it triggers every
-session and estate rule at least once.
+session and config rule at least once.
 """
 
 import json
@@ -151,7 +151,7 @@ for i, title in enumerate(["Refactor checkout flow", "Payment gateway audit"]):
 db.commit()
 db.close()
 
-# ---------- estate ----------
+# ---------- config ----------
 
 write(".claude/skills/legacy-importer/SKILL.md",
       "---\nname: legacy-importer\ndescription: Import products from the legacy CSV exporter.\n---\n\n"
@@ -179,4 +179,4 @@ write(mem + "feedback_no_force_push.md",
       "---\nname: no-force-push\ndescription: Never force-push shared branches\ntype: feedback\n---\n\nNever force-push to main or release branches.\n")
 
 print(f"staged home ready: {HOME}")
-print(f"try: HOME={HOME} cxwatch")
+print(f"try: HOME={HOME} cxwatch audit")
