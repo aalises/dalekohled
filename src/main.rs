@@ -1,5 +1,4 @@
 mod estate;
-mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -23,87 +22,55 @@ pub(crate) fn semantic_model() -> String {
 #[derive(Parser)]
 #[command(
     name = "cxwatch",
-    about = "Context hygiene for Claude Code, Codex, pi, and OpenCode sessions"
+    about = "Context hygiene for Claude Code, Codex, pi, and OpenCode sessions",
+    arg_required_else_help = true
 )]
 struct Cli {
     #[command(subcommand)]
-    cmd: Option<Cmd>,
+    cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Scan a session (default: most recent session across all harnesses)
-    Report {
+    /// Audit a session, or — with no session — your agent config across all transcripts
+    Audit {
+        /// Session to audit (file path or opencode:<id>); omit to audit static config
+        #[arg(conflicts_with = "fix")]
         session: Option<PathBuf>,
         /// Emit JSON
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         json: bool,
         /// Also run LLM semantic analysis
         #[arg(long)]
         semantic: bool,
-    },
-    /// Write a Markdown report (includes semantic pass)
-    Explain {
-        session: Option<PathBuf>,
-        /// Output file (default: cxwatch-demo.md)
+        /// Write a Markdown report to this file
         #[arg(short, long)]
         output: Option<String>,
+        /// Interactively apply mechanical config fixes (backups go to ~/.cache/cxwatch/trash)
+        #[arg(long, conflicts_with_all = ["json", "output", "semantic"])]
+        fix: bool,
+        /// With --fix: apply all mechanical fixes without prompting
+        #[arg(long, requires = "fix")]
+        yes: bool,
     },
     /// List available sessions
     Sessions,
-    /// Interactive session picker
-    Pick {
-        /// Start with the LLM semantic pass enabled
-        #[arg(long)]
-        semantic: bool,
-    },
-    /// One-line rot-o-meter for the most recent session (tmux status, shell prompts)
-    Status {
-        /// Specific session (file path or opencode:<id>); default: most recent
-        session: Option<PathBuf>,
-    },
-    /// Rot-o-meter for Claude Code's statusLine: reads the statusline JSON on stdin
-    Statusline,
-    /// Audit static context (skills, commands, MCP, memory) against observed usage
-    Estate {
-        /// Emit JSON
-        #[arg(long)]
-        json: bool,
-        /// Also run LLM contradiction/duplication analysis
-        #[arg(long)]
-        semantic: bool,
-        /// Write an agent-ready Markdown pruning plan to this file
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Interactively apply mechanical fixes (backups go to ~/.cache/cxwatch/trash)
-        #[arg(long)]
-        fix: bool,
-        /// With --fix: apply all mechanical fixes without prompting
-        #[arg(long)]
-        yes: bool,
-    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        None => tui::pick(false),
-        Some(Cmd::Report {
+        Cmd::Audit {
             session,
-            json,
-            semantic,
-        }) => report_cmd(session, json, semantic),
-        Some(Cmd::Explain { session, output }) => explain_cmd(session, output),
-        Some(Cmd::Sessions) => sessions_cmd(),
-        Some(Cmd::Status { session }) => status_cmd(session),
-        Some(Cmd::Statusline) => statusline_cmd(),
-        Some(Cmd::Pick { semantic }) => tui::pick(semantic),
-        Some(Cmd::Estate {
             json,
             semantic,
             output,
             fix,
             yes,
-        }) => estate::estate_cmd(json, semantic, output, fix, yes),
+        } => match session {
+            Some(path) => session_audit_cmd(path, json, semantic, output),
+            None => estate::estate_cmd(json, semantic, output, fix, yes),
+        },
+        Cmd::Sessions => sessions_cmd(),
     }
 }
 
@@ -158,8 +125,6 @@ pub(crate) struct SessionMeta {
     pub title: String,
     pub modified: SystemTime,
     pub size: u64,
-    /// First real user prompt, filled lazily by the TUI.
-    pub preview: Option<String>,
 }
 
 pub(crate) fn sessions() -> Vec<SessionMeta> {
@@ -181,7 +146,6 @@ pub(crate) fn sessions() -> Vec<SessionMeta> {
                 title,
                 modified,
                 size,
-                preview: None,
             });
         }
     }
@@ -237,8 +201,6 @@ fn opencode_sessions(out: &mut Vec<SessionMeta>) {
             modified: SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_millis(r["up"].as_u64().unwrap_or(0)),
             size: r["bytes"].as_u64().unwrap_or(0),
-            // the db already stores an LLM-generated session title — use it as the preview
-            preview: Some(r["title"].as_str().unwrap_or("").to_string()),
         });
     }
 }
@@ -340,65 +302,6 @@ pub(crate) fn decode_slug(slug: &str) -> String {
         "~".into()
     } else {
         t.replace('-', "/")
-    }
-}
-
-fn latest_session() -> Result<PathBuf> {
-    sessions()
-        .into_iter()
-        .next()
-        .map(|s| s.path)
-        .ok_or_else(|| anyhow::anyhow!("no sessions found under ~/.pi, ~/.claude or ~/.codex"))
-}
-
-/// First real user prompt of a session, for the picker. Scans only the head of the file.
-pub(crate) fn preview(source: Source, path: &Path) -> String {
-    use std::io::{BufRead, BufReader, Read};
-    let Ok(f) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let reader = BufReader::new(f.take(512 * 1024));
-    for line in reader.lines().map_while(Result::ok).take(120) {
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let text = match source {
-            Source::Pi => (v["type"] == "message" && v["message"]["role"] == "user")
-                .then(|| first_text(&v["message"]["content"]))
-                .flatten(),
-            Source::Claude => (v["type"] == "user" && v["isMeta"] != true)
-                .then(|| first_text(&v["message"]["content"]))
-                .flatten(),
-            Source::Codex => (v["type"] == "response_item"
-                && v["payload"]["type"] == "message"
-                && v["payload"]["role"] == "user")
-                .then(|| first_text(&v["payload"]["content"]))
-                .flatten(),
-            // preview comes from the db title, set at listing time
-            Source::OpenCode => return String::new(),
-        };
-        if let Some(t) = text {
-            let t = t.trim();
-            // skip injected context: tags, caveats, AGENTS.md preambles
-            if t.is_empty() || t.starts_with('<') || t.starts_with('#') || t.starts_with("Caveat:")
-            {
-                continue;
-            }
-            return clip(&t.split_whitespace().collect::<Vec<_>>().join(" "), 100);
-        }
-    }
-    String::new()
-}
-
-fn first_text(content: &Value) -> Option<String> {
-    match content {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(items) => items.iter().find_map(|i| {
-            matches!(i["type"].as_str(), Some("text" | "input_text"))
-                .then(|| i["text"].as_str().map(String::from))
-                .flatten()
-        }),
-        _ => None,
     }
 }
 
@@ -1214,11 +1117,12 @@ pub(crate) fn markdown(r: &Report) -> String {
 
 // ---------- subcommands ----------
 
-fn load(session: Option<PathBuf>, want_semantic: bool) -> Result<Report> {
-    let path = match session {
-        Some(p) => p,
-        None => latest_session()?,
-    };
+fn session_audit_cmd(
+    path: PathBuf,
+    json: bool,
+    want_semantic: bool,
+    output: Option<String>,
+) -> Result<()> {
     let events = parse(&path)?;
     let semantic = want_semantic.then(|| {
         semantic(&events).unwrap_or_else(|e| Semantic {
@@ -1227,24 +1131,15 @@ fn load(session: Option<PathBuf>, want_semantic: bool) -> Result<Report> {
             model_used: semantic_model(),
         })
     });
-    Ok(build_report(path.display().to_string(), &events, semantic))
-}
-
-fn report_cmd(session: Option<PathBuf>, json: bool, want_semantic: bool) -> Result<()> {
-    let r = load(session, want_semantic)?;
-    if json {
+    let r = build_report(path.display().to_string(), &events, semantic);
+    if let Some(out) = output {
+        std::fs::write(&out, markdown(&r))?;
+        println!("wrote {out}");
+    } else if json {
         println!("{}", serde_json::to_string_pretty(&r)?);
     } else {
         human(&r);
     }
-    Ok(())
-}
-
-fn explain_cmd(session: Option<PathBuf>, output: Option<String>) -> Result<()> {
-    let r = load(session, true)?;
-    let out = output.unwrap_or_else(|| "cxwatch-demo.md".into());
-    std::fs::write(&out, markdown(&r))?;
-    println!("wrote {out}");
     Ok(())
 }
 
@@ -1263,96 +1158,6 @@ fn sessions_cmd() -> Result<()> {
     Ok(())
 }
 
-// ---------- rot-o-meter ----------
-
-fn statusline_cmd() -> Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    status_cmd(transcript_from_statusline_json(&input))
-}
-
-fn status_cmd(session: Option<PathBuf>) -> Result<()> {
-    let (path, label) = match session {
-        Some(p) => {
-            let l = source_of_path(&p);
-            (p, l)
-        }
-        None => {
-            let s = sessions()
-                .into_iter()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no sessions found"))?;
-            (s.path, s.source.label())
-        }
-    };
-    println!("{}", status_line(&path, label));
-    Ok(())
-}
-
-fn transcript_from_statusline_json(input: &str) -> Option<PathBuf> {
-    serde_json::from_str::<Value>(input)
-        .ok()
-        .and_then(|v| v["transcript_path"].as_str().map(PathBuf::from))
-}
-
-fn source_of_path(p: &Path) -> &'static str {
-    let s = p.to_string_lossy();
-    if s.starts_with("opencode:") {
-        "opencode"
-    } else if s.contains("/.claude/") {
-        "claude"
-    } else if s.contains("/.codex/") {
-        "codex"
-    } else if s.contains("/.pi/") {
-        "pi"
-    } else {
-        "session"
-    }
-}
-
-/// One-line rot summary, cached by session size so statusline refreshes are instant.
-fn status_line(path: &Path, label: &str) -> String {
-    let key = path.display().to_string();
-    let size = session_size(path);
-    let cache_file = cache_dir().join("status.json");
-    let mut cache: Value = std::fs::read_to_string(&cache_file)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if cache[&key]["size"].as_u64() == Some(size)
-        && let Some(line) = cache[&key]["line"].as_str()
-    {
-        return line.to_string();
-    }
-    let line = match parse(path) {
-        Err(e) => format!("[{label}] cxwatch: {e}"),
-        Ok(events) => {
-            let r = build_report(key.clone(), &events, None);
-            let s = &r.summary;
-            format!(
-                "[{label}] rot {:>3}% {} ~{} tok reclaimable · {} findings",
-                s.reclaimable_pct,
-                meter(s.reclaimable_pct),
-                tok_fmt(s.reclaimable_tokens),
-                s.findings
-            )
-        }
-    };
-    cache[&key] = serde_json::json!({"size": size, "line": line});
-    let _ = std::fs::write(&cache_file, cache.to_string());
-    line
-}
-
-fn session_size(path: &Path) -> u64 {
-    if path.to_string_lossy().starts_with("opencode:") {
-        // any write to the db invalidates; over-invalidation is fine
-        opencode_db().metadata().map(|m| m.len()).unwrap_or(0)
-    } else {
-        path.metadata().map(|m| m.len()).unwrap_or(0)
-    }
-}
-
 pub(crate) fn cache_dir() -> PathBuf {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let dir = home.join(".cache/cxwatch");
@@ -1360,32 +1165,10 @@ pub(crate) fn cache_dir() -> PathBuf {
     dir
 }
 
-fn meter(pct: usize) -> String {
-    let filled = (pct.min(100) + 5) / 10;
-    format!(
-        "{}{}",
-        "█".repeat(filled),
-        "░".repeat(10usize.saturating_sub(filled))
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn rot_meter_and_statusline_json() {
-        assert_eq!(meter(0), "░░░░░░░░░░");
-        assert_eq!(meter(66), "███████░░░");
-        assert_eq!(meter(100), "██████████");
-        let j = r#"{"session_id":"s","transcript_path":"/tmp/x.jsonl","model":{"id":"m"}}"#;
-        assert_eq!(
-            transcript_from_statusline_json(j),
-            Some(PathBuf::from("/tmp/x.jsonl"))
-        );
-        assert_eq!(transcript_from_statusline_json("not json"), None);
-    }
 
     fn pi_call(id: &str, call_id: &str, name: &str, args: Value) -> Event {
         parse_line(

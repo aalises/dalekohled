@@ -1030,7 +1030,7 @@ pub(crate) fn tok_or_unknown(tokens: usize) -> String {
 pub(crate) fn human(r: &EstateReport) {
     let s = &r.summary;
     println!(
-        "cxwatch estate — static context vs usage in {} claude · {} codex · {} pi sessions",
+        "cxwatch audit — static config vs usage in {} claude · {} codex · {} pi sessions",
         s.sessions_claude, s.sessions_codex, s.sessions_pi
     );
     println!(
@@ -1040,7 +1040,7 @@ pub(crate) fn human(r: &EstateReport) {
         tok_fmt(s.tokens_flagged)
     );
     if r.findings.is_empty() {
-        println!("  ✔ estate is clean");
+        println!("  ✔ config is clean");
     }
     for f in &r.findings {
         println!(
@@ -1082,7 +1082,7 @@ pub(crate) const GROUPS: [(&str, &str); 10] = [
 pub(crate) fn markdown(r: &EstateReport) -> String {
     let s = &r.summary;
     let mut md = format!(
-        "# cxwatch estate — fix report\n\n\
+        "# cxwatch audit — fix report\n\n\
          - Sessions scanned: {} claude · {} codex · {} pi\n- Units audited: {}\n- Fixes: {}\n- Tokens flagged: ~{}\n\n\
          ## For the executing agent\n\n\
          You are cleaning up an AI coding agent's static context. Work through the checklists below top to\n\

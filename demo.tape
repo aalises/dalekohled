@@ -55,7 +55,7 @@ Sleep 600ms
 Escape
 Sleep 500ms
 
-# ── ③ the estate audit ──
+# ── ③ the config audit ──
 Ctrl+E
 Sleep 5s
 Down@250ms 2
@@ -84,7 +84,7 @@ Hide
 Type "clear"
 Enter
 Show
-Type "cxwatch estate -o cxwatch-cleanup.md && head -n 24 cxwatch-cleanup.md"
+Type "cxwatch audit -o cxwatch-cleanup.md && head -n 24 cxwatch-cleanup.md"
 Sleep 600ms
 Enter
 Sleep 6s
@@ -116,7 +116,7 @@ Sleep 4.5s
 
 # ── outro card ──
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — a linter for your coding agents\n\n   \033[1mgithub.com/aalises/dalekohled\033[0m\n\n   cargo install --git https://github.com/aalises/dalekohled\n\n   \033[2mMIT · sessions + estate + autofix + rot-o-meter\033[0m\n'`
+Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — a linter for your coding agents\n\n   \033[1mgithub.com/aalises/dalekohled\033[0m\n\n   cargo install --git https://github.com/aalises/dalekohled\n\n   \033[2mMIT · sessions + config audit + autofix + rot-o-meter\033[0m\n'`
 Enter
 Show
 Sleep 4.5s

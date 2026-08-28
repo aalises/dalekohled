@@ -17,19 +17,18 @@ cxwatch answers four practical questions:
 - Which parts of my agent setup show no observed use?
 - Which fixes can I apply now, and which ones need review?
 
-## One tool, three views
+## One tool, two views
 
 | View | What it does | Start it |
 |---|---|---|
-| Session audit | Finds stale reads and large context items in one run | `cxwatch` |
-| Estate audit | Compares static agent setup with observed transcript use | `cxwatch estate` |
-| Rot-o-meter | Shows a compact score for status lines and terminal bars | `cxwatch status` |
+| Session audit | Finds stale reads and large context items in one run | `cxwatch audit SESSION` |
+| Config audit | Compares static agent setup with observed transcript use | `cxwatch audit` |
 
 The default audits use local files. They do not change your agent configuration. cxwatch writes only its cache and the reports that you request. The `--fix` option is the only audit mode that changes agent setup.
 
 ## Supported harnesses
 
-| Harness | Session data | Estate data |
+| Harness | Session data | Config data |
 |---|---|---|
 | Claude Code | `~/.claude/projects` | Skills, commands, MCP servers, hooks, memory, and `CLAUDE.md` |
 | Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` | Plugin skills, MCP servers, and `AGENTS.md` |
@@ -44,10 +43,10 @@ You need Rust 1.88 or later.
 
 ```bash
 cargo install --git https://github.com/aalises/dalekohled
-cxwatch
+cxwatch audit
 ```
 
-The first command installs cxwatch. The second command opens the session picker.
+The first command installs cxwatch. The second command audits your agent config.
 
 If you use OpenCode, the `sqlite3` command must be available in your `PATH`.
 
@@ -61,42 +60,23 @@ cargo install --path .
 
 ## Your first audit
 
-Run cxwatch with no arguments:
-
 ```bash
-cxwatch
+cxwatch sessions
+cxwatch audit path/to/session.jsonl
+cxwatch audit
 ```
 
-Then:
-
-1. Type part of a project name or prompt to filter the session list.
-2. Select a session and press `Enter`.
-3. Review the largest findings first.
-4. Press `Ctrl+E` to audit persistent agent setup.
-5. Press `e` in a report to export a Markdown cleanup plan.
-
-For a quick non-interactive check:
-
-```bash
-cxwatch report
-cxwatch estate
-cxwatch status
-```
+The first command lists every discovered session. The second audits one of them. The third audits your persistent agent setup. Review the largest findings first, and use `-o cleanup.md` to export a Markdown cleanup plan.
 
 ## Command guide
 
 | Command | Result |
 |---|---|
-| `cxwatch` | Opens the interactive session picker |
-| `cxwatch report [SESSION]` | Audits one session, or the most recent session |
-| `cxwatch explain [SESSION] -o report.md` | Writes a Markdown session report and runs the semantic pass |
 | `cxwatch sessions` | Lists all discovered sessions |
-| `cxwatch pick [--semantic]` | Opens the picker and can enable semantic analysis at startup |
-| `cxwatch estate` | Audits skills, commands, MCP servers, hooks, memory, and instruction files |
-| `cxwatch estate -o cleanup.md` | Writes a reviewable Markdown cleanup plan |
-| `cxwatch estate --fix` | Offers each supported mechanical fix for confirmation |
-| `cxwatch status [SESSION]` | Prints a one-line score for a selected or recent session |
-| `cxwatch statusline` | Reads Claude Code status-line data from standard input and scores the current session |
+| `cxwatch audit SESSION` | Audits one session transcript |
+| `cxwatch audit` | Audits skills, commands, MCP servers, hooks, memory, and instruction files |
+| `cxwatch audit -o report.md` | Writes a Markdown report instead of printing (works with and without a session) |
+| `cxwatch audit --fix` | Offers each supported mechanical config fix for confirmation |
 
 A `SESSION` can be a transcript path. OpenCode sessions use the internal `opencode:<id>` form that `cxwatch sessions` prints.
 
@@ -119,9 +99,9 @@ events 644 · session ≈218.4k tok · 47 findings · ≈135.8k tok reclaimable 
 
 The session audit reports waste. It does not remove history from a running agent session.
 
-## Estate audit
+## Config audit
 
-An estate audit checks persistent context against observed use in local transcripts.
+A config audit checks persistent context against observed use in local transcripts.
 
 | Check | What it means |
 |---|---|
@@ -148,7 +128,7 @@ Each finding includes:
 
 ## Apply safe fixes
 
-cxwatch can apply a limited set of mechanical estate fixes:
+cxwatch can apply a limited set of mechanical config fixes:
 
 - add a missing memory index entry;
 - remove a broken memory index entry;
@@ -159,54 +139,16 @@ cxwatch can apply a limited set of mechanical estate fixes:
 Run the interactive fix flow:
 
 ```bash
-cxwatch estate --fix
+cxwatch audit --fix
 ```
 
 For each fix, choose `y`, `n`, `a` to apply all remaining fixes, or `q` to stop. To apply all supported fixes without prompts:
 
 ```bash
-cxwatch estate --fix --yes
+cxwatch audit --fix --yes
 ```
-
-In the interactive estate view, select a finding and press `f` twice. The first press shows the exact operation. The second press applies it.
 
 Before cxwatch edits a file, it saves a copy under `~/.cache/cxwatch/trash`. cxwatch moves deleted files and directories to the same location. A fix that runs an external command uses that command’s behavior. Findings that need judgment stay report-only.
-
-## Keep the score visible
-
-`cxwatch status` prints a one-line rot score:
-
-```text
-[codex] rot  62% ██████░░░░ ~135.8k tok reclaimable · 47 findings
-```
-
-Without a session argument, it scores the most recent discovered session. cxwatch caches the line by session size, so frequent status refreshes do not repeat the full audit when the session did not change.
-
-### Claude Code status line
-
-Add this setting to `~/.claude/settings.json`:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "cxwatch statusline"
-  }
-}
-```
-
-Claude Code sends the current transcript path on standard input. `cxwatch statusline` uses that path, so the score follows the active Claude Code session.
-
-### tmux
-
-Add these lines to `~/.tmux.conf`:
-
-```tmux
-set -g status-right '#(cxwatch status)'
-set -g status-interval 15
-```
-
-This form shows the latest discovered session across all supported agents.
 
 ## Local analysis and optional semantic analysis
 
@@ -215,17 +157,14 @@ Deterministic audits stay on your computer. They parse transcripts, count tokens
 The optional semantic pass looks for contradictions and repeated guidance that fixed rules cannot detect:
 
 ```bash
-cxwatch report --semantic
-cxwatch estate --semantic -o cleanup.md
-cxwatch pick --semantic
+cxwatch audit path/to/run.jsonl --semantic
+cxwatch audit --semantic -o cleanup.md
 ```
-
-`cxwatch explain` also runs the semantic pass.
 
 Semantic analysis needs the `pi` command. The default model is `moonshotai/kimi-k3`. Set `CXWATCH_SEMANTIC_MODEL` to select another model:
 
 ```bash
-CXWATCH_SEMANTIC_MODEL=provider/model cxwatch report --semantic
+CXWATCH_SEMANTIC_MODEL=provider/model cxwatch audit --semantic
 ```
 
 The semantic pass sends a limited digest through `pi` to the configured model provider. The digest can contain session messages, instructions, skill text, and memory text. Check the provider’s data policy before you enable this option.
@@ -235,8 +174,8 @@ The semantic pass sends a limited digest through `pi` to the configured model pr
 Use JSON when another tool must process the report:
 
 ```bash
-cxwatch report --json
-cxwatch estate --json
+cxwatch audit path/to/run.jsonl --json
+cxwatch audit --json
 ```
 
 The JSON includes the report version, summary, findings, token counts, and fix details.
@@ -244,45 +183,18 @@ The JSON includes the report version, summary, findings, token counts, and fix d
 Use Markdown when a person or another agent must review the work:
 
 ```bash
-cxwatch explain path/to/run.jsonl -o session-report.md
-cxwatch estate -o cleanup.md
+cxwatch audit path/to/run.jsonl -o session-report.md
+cxwatch audit -o cleanup.md
 ```
 
-The estate plan groups findings by action and gives each item a concrete checklist entry.
-
-## Interactive controls
-
-### Session picker
-
-| Key | Action |
-|---|---|
-| Type text | Filter by agent, project, or prompt |
-| `Up` / `Down` | Move through sessions |
-| `Enter` | Audit the selected session |
-| `Ctrl+E` | Open the estate audit |
-| `Tab` | Enable or disable semantic analysis |
-| `Esc` | Clear the filter, or exit when the filter is empty |
-| `Ctrl+C` | Exit |
-
-### Report view
-
-| Key | Action |
-|---|---|
-| `Up` / `Down` | Scroll |
-| `Enter` | Show the proposed estate fix |
-| `f` twice | Confirm and apply a mechanical estate fix |
-| `e` | Export a Markdown report |
-| `Esc` | Return to the picker |
-| `q` | Exit |
-
-The `Enter` and `f` actions apply only to estate findings.
+The config plan groups findings by action and gives each item a concrete checklist entry.
 
 ## Accuracy and limits
 
 - Token counts use the `o200k` tokenizer. They are estimates, not provider billing data.
 - The report depends on the transcript formats that each agent writes.
 - Shell analysis recognizes common file readers such as `cat`, `head`, `tail`, and `sed`.
-- An estate use count includes only the transcripts that are available on the computer.
+- A config use count includes only the transcripts that are available on the computer.
 - The semantic pass can find nuanced problems, but its output still needs review.
 - cxwatch audits context. It does not compact or rewrite an active session.
 
