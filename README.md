@@ -42,7 +42,7 @@ cxwatch reads OpenCode session data through the local `sqlite3` command in read-
 You need Rust 1.88 or later.
 
 ```bash
-cargo install --git https://github.com/n8n-io/dalekohded
+cargo install --git https://github.com/aalises/dalekohled
 cxwatch audit
 ```
 
@@ -53,7 +53,7 @@ If you use OpenCode, the `sqlite3` command must be available in your `PATH`.
 To install from a local clone:
 
 ```bash
-git clone https://github.com/n8n-io/dalekohded.git
+git clone https://github.com/aalises/dalekohled.git
 cd dalekohled
 cargo install --path .
 ```
