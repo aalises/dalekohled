@@ -289,7 +289,7 @@ pub(crate) fn audit() -> EstateReport {
             if uses == 0 && age_days(now, md.modified().ok()) > GRACE_DAYS {
                 let reads = usage.skill_reads_claude.get(&name).copied().unwrap_or(0);
                 let reads_note = if reads > 0 {
-                    format!(" ({reads} raw file reads observed — hooks or manual)")
+                    format!(" ({reads} raw file reads observed, hooks or manual)")
                 } else {
                     String::new()
                 };
@@ -440,7 +440,7 @@ pub(crate) fn audit() -> EstateReport {
         if uses_of(own, name) == 0 {
             let cross = uses_of(other, name);
             let cross_note = if cross > 0 {
-                format!(" (used {cross}× in {other_label} — keep it there only)")
+                format!(" (used {cross}× in {other_label}, keep it there only)")
             } else {
                 String::new()
             };
@@ -466,7 +466,7 @@ pub(crate) fn audit() -> EstateReport {
                 tokens: 0,
                 uses: 0,
                 detail: format!(
-                    "mounted ({scope}), 0 calls across {sessions} {harness} sessions — instructions + tool listing paid every session{cross_note}"
+                    "mounted ({scope}), 0 calls across {sessions} {harness} sessions; instructions + tool listing paid every session{cross_note}"
                 ),
                 action: "disable",
             });
@@ -520,8 +520,7 @@ pub(crate) fn audit() -> EstateReport {
                             ),
                             tokens: crate::estimate_tokens(&body),
                             uses: 0,
-                            detail: "on disk but missing from MEMORY.md index — never loaded"
-                                .into(),
+                            detail: "on disk but missing from MEMORY.md index, never loaded".into(),
                             action: "repair index",
                         });
                     }
@@ -532,7 +531,7 @@ pub(crate) fn audit() -> EstateReport {
                             unit: format!("memory {project}/{fname}"),
                             path: p.display().to_string(),
                             fix: format!(
-                                "edit {} — update or remove each reference to: {}",
+                                "edit {} and update or remove each reference to: {}",
                                 p.display(),
                                 missing.join(", ")
                             ),
@@ -592,7 +591,7 @@ pub(crate) fn audit() -> EstateReport {
                     unit: format!("CLAUDE.md × skill {name}"),
                     path: home.join(".claude/CLAUDE.md").display().to_string(),
                     fix: format!(
-                        "edit ~/.claude/CLAUDE.md: keep at most one `{name}` trigger line, delete the other mentions — the skill's own description already announces it"
+                        "edit ~/.claude/CLAUDE.md: keep at most one `{name}` trigger line and delete the other mentions; the skill's own description already announces it"
                     ),
                     tokens: 0,
                     uses: mentions,
@@ -626,7 +625,7 @@ pub(crate) fn audit() -> EstateReport {
                 unit: label.into(),
                 path: home.join(rel).display().to_string(),
                 fix: format!(
-                    "edit {} — update or remove each reference to: {}",
+                    "edit {} and update or remove each reference to: {}",
                     home.join(rel).display(),
                     missing.join(", ")
                 ),
@@ -1030,7 +1029,7 @@ pub(crate) fn tok_or_unknown(tokens: usize) -> String {
 pub(crate) fn human(r: &EstateReport) {
     let s = &r.summary;
     println!(
-        "cxwatch audit — static config vs usage in {} claude · {} codex · {} pi sessions",
+        "cxwatch audit · static config vs usage in {} claude · {} codex · {} pi sessions",
         s.sessions_claude, s.sessions_codex, s.sessions_pi
     );
     println!(
@@ -1044,7 +1043,7 @@ pub(crate) fn human(r: &EstateReport) {
     }
     for f in &r.findings {
         println!(
-            "  {:<20} {:>7} {:>5}  {} — {} → {}",
+            "  {:<20} {:>7} {:>5}  {}: {} → {}",
             f.rule,
             tok_or_unknown(f.tokens),
             format!("{}×", f.uses),
@@ -1052,6 +1051,7 @@ pub(crate) fn human(r: &EstateReport) {
             f.detail,
             f.action
         );
+        println!("      fix: {}", f.fix);
     }
     if let Some(sem) = &r.semantic {
         println!("  semantic ({}):", sem.model_used);
@@ -1064,6 +1064,11 @@ pub(crate) fn human(r: &EstateReport) {
             sem.bloating.replace('\n', "\n      ")
         );
     }
+    if !r.findings.is_empty() {
+        println!(
+            "  → rerun with -o plan.md for an agent-ready fix plan, or --fix to apply mechanical fixes"
+        );
+    }
 }
 
 pub(crate) const GROUPS: [(&str, &str); 10] = [
@@ -1073,8 +1078,8 @@ pub(crate) const GROUPS: [(&str, &str); 10] = [
     ("heavy-block", "Tighten heavy instruction blocks"),
     ("hook-tax", "Slim hook payloads"),
     ("dead-command", "Delete unused commands"),
-    ("orphan-memory", "Repair memory indexes — orphaned files"),
-    ("dangling-index", "Repair memory indexes — dangling entries"),
+    ("orphan-memory", "Repair memory indexes: orphaned files"),
+    ("dangling-index", "Repair memory indexes: dangling entries"),
     ("stale-ref", "Fix stale references"),
     ("stale-memory", "Review stale memories"),
 ];
@@ -1082,7 +1087,7 @@ pub(crate) const GROUPS: [(&str, &str); 10] = [
 pub(crate) fn markdown(r: &EstateReport) -> String {
     let s = &r.summary;
     let mut md = format!(
-        "# cxwatch audit — fix report\n\n\
+        "# cxwatch audit fix report\n\n\
          - Sessions scanned: {} claude · {} codex · {} pi\n- Units audited: {}\n- Fixes: {}\n- Tokens flagged: ~{}\n\n\
          ## For the executing agent\n\n\
          You are cleaning up an AI coding agent's static context. Work through the checklists below top to\n\
@@ -1105,7 +1110,7 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
         }
         let saved: usize = group.iter().map(|f| f.tokens).sum();
         let saved_note = if saved > 0 {
-            format!(" — ~{} tok", tok_fmt(saved))
+            format!(", ~{} tok", tok_fmt(saved))
         } else {
             String::new()
         };
@@ -1117,7 +1122,7 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
                 String::new()
             };
             md.push_str(&format!(
-                "- [ ] **{}**{tok_note} — {}\n      - why: {}\n      - file: `{}`\n",
+                "- [ ] **{}**{tok_note}: {}\n      - why: {}\n      - file: `{}`\n",
                 f.unit, f.fix, f.detail, f.path
             ));
         }
@@ -1137,7 +1142,7 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
     }
     if let Some(sem) = &r.semantic {
         md.push_str(&format!(
-            "## Semantic findings ({})\n\nLLM-reported — discuss with the user before acting; propose a fix per item.\n\n\
+            "## Semantic findings ({})\n\nLLM-reported; discuss with the user before acting and propose a fix per item.\n\n\
              ### Contradictions\n{}\n\n### Duplication\n{}\n",
             sem.model_used, sem.contradiction, sem.bloating
         ));
@@ -1252,7 +1257,7 @@ fn backup(file: &str) -> Result<()> {
 /// Apply a mechanical fix. Every destructive step is backed up under ~/.cache/cxwatch/trash.
 pub(crate) fn apply_fix(op: &FixOp) -> Result<String> {
     match op {
-        FixOp::Manual => anyhow::bail!("no mechanical fix — use the exported plan"),
+        FixOp::Manual => anyhow::bail!("no mechanical fix; use the exported plan"),
         FixOp::AppendLine { file, line } => {
             backup(file)?;
             let mut s = std::fs::read_to_string(file).unwrap_or_default();
@@ -1335,7 +1340,7 @@ fn fix_flow(r: &EstateReport, yes: bool) -> Result<()> {
         .filter(|f| fix_op(f) != FixOp::Manual)
         .collect();
     if mechanical.is_empty() {
-        println!("no mechanical fixes available — export the plan for the rest (-o plan.md)");
+        println!("no mechanical fixes available; export the plan for the rest (-o plan.md)");
         return Ok(());
     }
     println!(
@@ -1347,7 +1352,7 @@ fn fix_flow(r: &EstateReport, yes: bool) -> Result<()> {
     let stdin = std::io::stdin();
     'outer: for f in mechanical {
         let op = fix_op(f);
-        println!("\n  {:<18} {} — {}", f.rule, f.unit, f.detail);
+        println!("\n  {:<18} {}: {}", f.rule, f.unit, f.detail);
         println!("  fix: {}", op.describe());
         let go = all || {
             print!("  apply? [y]es [N]o [a]ll [q]uit ");

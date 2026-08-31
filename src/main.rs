@@ -32,7 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Audit a session, or — with no session — your agent config across all transcripts
+    /// Audit a session, or your agent config across all transcripts when no session is given
     Audit {
         /// Session to audit (file path or opencode:<id>); omit to audit static config
         #[arg(conflicts_with = "fix")]
@@ -709,6 +709,7 @@ pub(crate) struct Finding {
     pub event_idx: usize,
     pub event_id: String,
     pub detail: String,
+    pub fix: String,
     pub tokens: usize,
 }
 
@@ -737,7 +738,8 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
                             rule: "huge-thinking",
                             event_idx: idx,
                             event_id: ev.id.clone(),
-                            detail: format!("thinking block of ~{tokens} tok — condense or drop"),
+                            detail: "extended thinking block".into(),
+                            fix: "condense to its conclusion or drop it when compacting".into(),
                             tokens,
                         });
                     }
@@ -798,10 +800,8 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
                 rule: "superseded-read",
                 event_idx: op.idx,
                 event_id: op.id.clone(),
-                detail: format!(
-                    "{} re-read at #{} — this earlier copy is dead weight",
-                    op.path, r.idx
-                ),
+                detail: format!("{} re-read at #{}", op.path, r.idx),
+                fix: format!("drop this copy; the read at #{} is the live one", r.idx),
                 tokens,
             });
             flagged.insert(&op.call_id);
@@ -810,10 +810,8 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
                 rule: "stale-read",
                 event_idx: op.idx,
                 event_id: op.id.clone(),
-                detail: format!(
-                    "{} edited at #{} — this read no longer matches disk",
-                    op.path, m.idx
-                ),
+                detail: format!("{} edited at #{}, no longer matches disk", op.path, m.idx),
+                fix: format!("drop it and re-read {} before relying on it", op.path),
                 tokens,
             });
             flagged.insert(&op.call_id);
@@ -831,7 +829,8 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
                 rule: "huge-output",
                 event_idx: *idx,
                 event_id: id.clone(),
-                detail: format!("{desc} returned ~{tokens} tok — trim or summarize"),
+                detail: format!("oversized result from {desc}"),
+                fix: "keep only the lines the conversation used; re-run it if needed".into(),
                 tokens,
             });
         }
@@ -1052,7 +1051,7 @@ pub(crate) fn clip(s: &str, n: usize) -> String {
 
 fn human(r: &Report) {
     let s = &r.summary;
-    println!("cxwatch — {}", r.session);
+    println!("cxwatch · {}", r.session);
     println!(
         "  events {} · session ≈{} tok · {} findings · ≈{} tok reclaimable ({}%)",
         s.total_events,
@@ -1069,6 +1068,7 @@ fn human(r: &Report) {
             f.event_idx,
             f.detail
         );
+        println!("      fix: {}", f.fix);
     }
     if let Some(sem) = &r.semantic {
         println!("  semantic ({}):", sem.model_used);
@@ -1081,12 +1081,15 @@ fn human(r: &Report) {
             sem.bloating.replace('\n', "\n      ")
         );
     }
+    if !r.findings.is_empty() {
+        println!("  → rerun with -o report.md for an agent-ready cleanup prompt");
+    }
 }
 
 pub(crate) fn markdown(r: &Report) -> String {
     let s = &r.summary;
     let mut md = format!(
-        "# cxwatch report\n\n- Session: `{}`\n- Events: {}\n- Session size: ~{} tok\n- Findings: {}\n- Reclaimable: ~{} tok ({}%)\n\n## Findings\n\n",
+        "# cxwatch report\n\n- Session: `{}`\n- Events: {}\n- Session size: ~{} tok\n- Findings: {}\n- Reclaimable: ~{} tok ({}%)\n\n",
         r.session,
         s.total_events,
         tok_fmt(s.session_tokens),
@@ -1095,15 +1098,25 @@ pub(crate) fn markdown(r: &Report) -> String {
         s.reclaimable_pct
     );
     if r.findings.is_empty() {
-        md.push_str("No mechanical rot detected.\n");
+        md.push_str("## Findings\n\nNo mechanical rot detected.\n");
+    } else {
+        md.push_str(
+            "## For the executing agent\n\n\
+             You are reclaiming context in an AI coding agent's session. History cannot be edited in\n\
+             place, so apply each fix at the next compaction, summary, or restart. Work top to bottom;\n\
+             findings are sorted by token cost. Do not drop anything not listed here. When finished,\n\
+             summarize what was reclaimed.\n\n\
+             ## Findings\n\n",
+        );
     }
     for f in &r.findings {
         md.push_str(&format!(
-            "- **{}** (#{}): {} — ~{} tok\n",
+            "- **{}** (#{}): {} (~{} tok)\n  - fix: {}\n",
             f.rule,
             f.event_idx,
             f.detail,
-            tok_fmt(f.tokens)
+            tok_fmt(f.tokens),
+            f.fix
         ));
     }
     if let Some(sem) = &r.semantic {
