@@ -1053,7 +1053,7 @@ fn human(r: &Report) {
     let s = &r.summary;
     println!("cxwatch · {}", r.session);
     println!(
-        "  events {} · session ≈{} tok · {} findings · ≈{} tok reclaimable ({}%)",
+        "  events {} · session ≈{} tok · {} findings · ≈{} tok wasted ({}%)",
         s.total_events,
         tok_fmt(s.session_tokens),
         s.findings,
@@ -1069,6 +1069,13 @@ fn human(r: &Report) {
             f.detail
         );
         println!("      fix: {}", f.fix);
+    }
+    let prevent = prevention(&r.findings);
+    if !prevent.is_empty() {
+        println!("  prevent next time (this session's tokens are already spent):");
+        for p in &prevent {
+            println!("    → {p}");
+        }
     }
     if let Some(sem) = &r.semantic {
         println!("  semantic ({}):", sem.model_used);
@@ -1086,10 +1093,39 @@ fn human(r: &Report) {
     }
 }
 
+/// Session waste is already spent; these map recurring patterns to changes
+/// that make the next session cheaper.
+fn prevention(findings: &[Finding]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mcp: usize = findings
+        .iter()
+        .filter(|f| f.rule == "huge-output" && f.detail.contains("mcp__"))
+        .map(|f| f.tokens)
+        .sum();
+    if mcp > 0 {
+        out.push(format!(
+            "~{} tok of oversized MCP results — cap tool output (e.g. MAX_MCP_OUTPUT_TOKENS for Claude Code) or route heavy fetches through a subagent",
+            tok_fmt(mcp)
+        ));
+    }
+    let reread: usize = findings
+        .iter()
+        .filter(|f| matches!(f.rule, "superseded-read" | "stale-read"))
+        .map(|f| f.tokens)
+        .sum();
+    if reread > 0 {
+        out.push(format!(
+            "~{} tok of re-read files — agent behavior, not a config problem; compact or restart long sessions sooner",
+            tok_fmt(reread)
+        ));
+    }
+    out
+}
+
 pub(crate) fn markdown(r: &Report) -> String {
     let s = &r.summary;
     let mut md = format!(
-        "# cxwatch report\n\n- Session: `{}`\n- Events: {}\n- Session size: ~{} tok\n- Findings: {}\n- Reclaimable: ~{} tok ({}%)\n\n",
+        "# cxwatch report\n\n- Session: `{}`\n- Events: {}\n- Session size: ~{} tok\n- Findings: {}\n- Wasted: ~{} tok ({}%)\n\n",
         r.session,
         s.total_events,
         tok_fmt(s.session_tokens),
@@ -1118,6 +1154,15 @@ pub(crate) fn markdown(r: &Report) -> String {
             tok_fmt(f.tokens),
             f.fix
         ));
+    }
+    let prevent = prevention(&r.findings);
+    if !prevent.is_empty() {
+        md.push_str(
+            "\n## Prevent next time\n\nThe tokens above are already spent; these are the changes that make the next session cheaper.\n\n",
+        );
+        for p in &prevent {
+            md.push_str(&format!("- {p}\n"));
+        }
     }
     if let Some(sem) = &r.semantic {
         md.push_str(&format!(
@@ -1361,6 +1406,31 @@ await tools.apply_patch(patch);"#;
                 (Action::Mutate, "c.txt".into()),
             ]
         );
+    }
+
+    #[test]
+    fn prevention_maps_waste_to_config_changes() {
+        let f = |rule: &'static str, detail: &str, tokens| Finding {
+            rule,
+            event_idx: 0,
+            event_id: String::new(),
+            detail: detail.into(),
+            fix: String::new(),
+            tokens,
+        };
+        let lines = prevention(&[
+            f(
+                "huge-output",
+                "oversized result from mcp__notion__fetch",
+                5000,
+            ),
+            f("huge-output", "oversized result from Bash `ls`", 3000),
+            f("superseded-read", "a.txt re-read at #3", 1000),
+        ]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("5.0k") && lines[0].contains("MCP"));
+        assert!(lines[1].contains("1.0k") && lines[1].contains("re-read"));
+        assert!(prevention(&[]).is_empty());
     }
 
     #[test]
