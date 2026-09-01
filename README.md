@@ -97,17 +97,21 @@ For stale and superseded reads, cxwatch assigns the cost of the related tool res
 events 644 · session ≈218.4k tok · 47 findings · ≈135.8k tok reclaimable (62%)
 ```
 
-The session audit reports waste. It does not remove history from a running agent session.
+The session audit reports waste. Every finding names a copy inside the conversation to drop at the next compaction. cxwatch never asks you to change files on disk, and it does not remove history from a running agent session.
 
 ## Config audit
 
-A config audit checks persistent context against observed use in local transcripts.
+A config audit checks persistent context against observed use in local transcripts. It also audits how you and the agent interact: repeated instructions, commands that keep failing or getting blocked, and session length.
 
 | Check | What it means |
 |---|---|
 | `dead-mcp` | An MCP server has no observed calls in its configured agent |
 | `dead-skill` | A skill has no observed use after a 14-day grace period |
 | `dead-command` | A Claude Code command has no observed use |
+| `repeated-directive` | You typed the same instruction in three or more sessions; it belongs in `CLAUDE.md` |
+| `blocked-command` | A shell command was permission-denied three or more times |
+| `failing-command` | A shell command failed in at least half of three or more runs |
+| `long-sessions` | A quarter or more of a harness's sessions exceed roughly 150k tokens |
 | `duplicate-directive` | `CLAUDE.md` repeats guidance for a skill |
 | `hook-tax` | A Claude Code hook injects a large payload |
 | `orphan-memory` | A memory file is missing from `MEMORY.md` |
@@ -115,6 +119,8 @@ A config audit checks persistent context against observed use in local transcrip
 | `stale-ref` | An instruction or memory file points to a missing path |
 | `stale-memory` | A memory file has not changed for 120 days |
 | `heavy-block` | An always-loaded instruction section contains more than 400 tokens |
+
+A harness with no local sessions gives no evidence, so cxwatch omits it from the report entirely: no findings, no zero counts. The report also shows a per-harness session size distribution (median, p90, and the count of long sessions) from rough per-transcript token estimates.
 
 Each finding includes:
 
@@ -132,6 +138,7 @@ cxwatch can apply a limited set of mechanical config fixes:
 
 - add a missing memory index entry;
 - remove a broken memory index entry;
+- append a repeated instruction to `~/.claude/CLAUDE.md`;
 - move an unused Claude Code skill or command to the cxwatch trash;
 - remove an unused Claude Code MCP server with `claude mcp remove`;
 - remove an unused Codex MCP table from `config.toml`.
@@ -154,7 +161,7 @@ Before cxwatch edits a file, it saves a copy under `~/.cache/cxwatch/trash`. cxw
 
 Deterministic audits stay on your computer. They parse transcripts, count tokens, match file operations, and compare configured units with observed calls.
 
-The optional semantic pass looks for contradictions and repeated guidance that fixed rules cannot detect:
+The optional semantic pass looks for contradictions and repeated guidance that fixed rules cannot detect. For the config audit this includes instructions you keep typing in different words across sessions, with a proposed `CLAUDE.md` line for each:
 
 ```bash
 cxwatch audit path/to/run.jsonl --semantic
