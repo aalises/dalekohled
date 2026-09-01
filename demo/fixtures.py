@@ -84,6 +84,37 @@ session_clean = [
 ]
 write(".claude/projects/-Users-demo-dev-acmeapi/22222222-2222-4222-8222-222222222222.jsonl", jsonl(session_clean), NOW - 180)
 
+# ---------- claude interaction sessions: repeated directive, denied + failing commands ----------
+# two of the three are oversized so the long-sessions advisory fires too
+
+DENIAL = "The user doesn't want to proceed with this tool use. The tool use was rejected."
+FILLER = ("// " + "checkout regression trace, keep for the report. " * 3 + "\n") * 9000
+
+
+def interaction_session(n, long):
+    lines = [
+        {"type": "user", "uuid": f"w{n}0", "message": {"role": "user", "content": "use simple language, no fluff"}},
+        {"type": "assistant", "uuid": f"w{n}1", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": f"b{n}1", "name": "Bash", "input": {"command": "git push origin main"}}]}},
+        {"type": "user", "uuid": f"w{n}2", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"b{n}1", "content": DENIAL, "is_error": True}]}},
+        {"type": "assistant", "uuid": f"w{n}3", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": f"b{n}2", "name": "Bash", "input": {"command": "pnpm test --filter checkout"}}]}},
+        {"type": "user", "uuid": f"w{n}4", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"b{n}2", "content": "Error: Cannot find module 'vitest'", "is_error": True}]}},
+    ]
+    if long:
+        lines.append({"type": "user", "uuid": f"w{n}5", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": f"b{n}3", "content": FILLER}]}})
+    lines.append({"type": "assistant", "uuid": f"w{n}9", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "Plain summary: tests still red, push blocked; see above."}]}})
+    return lines
+
+
+for n, long in ((3, True), (4, True), (5, False)):
+    write(f".claude/projects/-Users-demo-dev-acmeshop/{n}{n}{n}{n}{n}{n}{n}{n}-{n}{n}{n}{n}-4{n}{n}{n}-8{n}{n}{n}-{n * 12}.jsonl",
+          jsonl(interaction_session(n, long)), NOW - 90 * n)
+
 # ---------- codex session ----------
 
 codex = [
@@ -158,10 +189,9 @@ write(".claude/skills/legacy-importer/SKILL.md",
       + "Steps to import the legacy catalog dumps. " * 60, OLD)
 write(".claude/skills/deploy-helper/SKILL.md",
       "---\nname: deploy-helper\ndescription: Ship a release to staging and production.\n---\n\nRun the deploy pipeline.\n", OLD)
-write(".claude/commands/scaffold.md", "Scaffold a new acmeshop module with tests and docs.\n", OLD)
 write(".claude/commands/ship.md", "Tag, changelog, deploy to prod, announce in the channel.\n", OLD)
 write(".claude/CLAUDE.md",
-      "# deploy-helper\nUse the deploy-helper skill for releases. When I say ship it, invoke deploy-helper.\n\n"
+      "# Releases\nWhen I say ship it, invoke the deploy-helper skill.\n\n"
       "# Release process notes\n" + "The release train leaves every Tuesday; check the migration matrix, warm the caches, rotate the canary cohort, then watch the error budget dashboards for thirty minutes before promoting. " * 18)
 write(".claude.json", json.dumps({"mcpServers": {"figma": {}, "github": {}}}))
 write(".codex/config.toml", "[mcp_servers.jira]\nurl = \"https://example.invalid/mcp\"\n")
@@ -174,7 +204,7 @@ write(mem + "MEMORY.md",
 write(mem + "feedback_use_pnpm.md",
       "---\nname: use-pnpm\ndescription: Always use pnpm, never npm\ntype: feedback\n---\n\nUse pnpm for everything.\n", OLD)
 write(mem + "reference_build_cache.md",
-      "---\nname: build-cache\ndescription: Build cache location\ntype: reference\n---\n\nThe cache lives at /tmp/acme-build-cache/ and is safe to delete.\n", OLD)
+      "---\nname: build-cache\ndescription: Build cache location\ntype: reference\n---\n\nThe build cache lives next to the repo checkout and is safe to delete.\n", OLD)
 write(mem + "feedback_no_force_push.md",
       "---\nname: no-force-push\ndescription: Never force-push shared branches\ntype: feedback\n---\n\nNever force-push to main or release branches.\n")
 

@@ -9,7 +9,7 @@ Set Shell "zsh"
 Set Theme "Catppuccin Mocha"
 Set FontSize 26
 Set Width 2400
-Set Height 1350
+Set Height 1550
 Set Padding 32
 Set TypingSpeed 75ms
 
@@ -58,7 +58,7 @@ Sleep 5s
 
 # ── ③ audit your config ──
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;33m③  AUDIT YOUR CONFIG\033[0m\n\n   skills nobody invokes, MCP servers nobody calls, broken memory\n   indexes, oversized instruction blocks — joined against\n   real usage from your transcripts\n'`
+Type `clear && printf '\n\n\n\n   \033[1;33m③  AUDIT YOUR CONFIG\033[0m\n\n   skills nobody invokes, MCP servers nobody calls, instructions you\n   keep retyping, commands that keep failing or getting blocked,\n   sessions that run too long — joined against real usage\n   from your transcripts\n'`
 Enter
 Show
 Sleep 3s
@@ -69,7 +69,7 @@ Show
 Type "cxwatch audit"
 Sleep 600ms
 Enter
-Sleep 6s
+Sleep 7s
 
 # ── ④ autofix ──
 Hide
@@ -100,14 +100,14 @@ Type "cxwatch audit -o cxwatch-cleanup.md && head -n 24 cxwatch-cleanup.md"
 Sleep 600ms
 Enter
 Sleep 6s
-Type "clear && sed -n '/Always-loaded/,$p' cxwatch-cleanup.md"
+Type "clear && sed -n '/Session size/,$p' cxwatch-cleanup.md"
 Sleep 600ms
 Enter
 Sleep 4s
 
 # ── outro card ──
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — a linter for your coding agents\n\n   \033[1mgithub.com/n8n-io/dalekohded\033[0m\n\n   cargo install --git https://github.com/n8n-io/dalekohded\n\n   \033[2mMIT · session audit + config audit + autofix\033[0m\n'`
+Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — a linter for your coding agents\n\n   \033[1mgithub.com/aalises/dalekohled\033[0m\n\n   cargo install --git https://github.com/aalises/dalekohled\n\n   \033[2mMIT · session audit + config audit + autofix\033[0m\n'`
 Enter
 Show
 Sleep 4.5s
