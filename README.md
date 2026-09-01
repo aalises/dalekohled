@@ -91,13 +91,13 @@ A session audit reads one transcript and sorts findings by estimated token cost.
 | `huge-thinking` | A reasoning block contains more than 2,000 tokens |
 | `huge-output` | A tool result contains more than 2,500 tokens |
 
-For stale and superseded reads, cxwatch assigns the cost of the related tool result. The summary shows estimated session tokens, reclaimable tokens, and a reclaimable percentage.
+For stale and superseded reads, cxwatch assigns the cost of the related tool result. The summary shows estimated session tokens, wasted tokens, and a wasted percentage.
 
 ```text
-events 644 · session ≈218.4k tok · 47 findings · ≈135.8k tok reclaimable (62%)
+events 644 · session ≈218.4k tok · 47 findings · ≈135.8k tok wasted (62%)
 ```
 
-The session audit reports waste. It does not remove history from a running agent session.
+The session audit reports waste that has already been paid. It does not remove history from a running agent session. The report therefore ends with a **prevent next time** list that turns recurring patterns into config changes: oversized MCP results suggest an output cap or subagent routing, while re-read files are agent behavior with no user action beyond compacting sooner.
 
 ## Config audit
 
@@ -123,6 +123,12 @@ Each finding includes:
 - the observed-use count;
 - the relevant file path;
 - a proposed action and concrete fix.
+
+Findings are grouped by what you should do with them, so the next step is always explicit:
+
+- **Apply now** — mechanical fixes that `cxwatch audit --fix` applies for you;
+- **Review** — one manual edit each, with the exact change stated;
+- **Informational** — weak signals (such as references to expired paths) that are fine to ignore.
 
 “No observed use” is evidence from the transcripts that cxwatch can read. It is not proof that you will never need the item. Review the cleanup plan before you remove configuration.
 

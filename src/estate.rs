@@ -1026,14 +1026,33 @@ pub(crate) fn tok_or_unknown(tokens: usize) -> String {
     }
 }
 
+/// Presentation bucket: 0 = mechanical (`--fix` applies it), 1 = one manual
+/// edit, 2 = weak signal, fine to ignore.
+pub(crate) fn bucket(f: &EstateFinding) -> usize {
+    if fix_op(f) != FixOp::Manual {
+        0
+    } else if f.rule == "stale-ref" {
+        2
+    } else {
+        1
+    }
+}
+
+const BUCKET_LABELS: [(usize, &str); 3] = [
+    (0, "apply now — `cxwatch audit --fix` does these"),
+    (1, "review — one manual edit each"),
+    (2, "informational — weak signal, fine to ignore"),
+];
+
 pub(crate) fn human(r: &EstateReport) {
     let s = &r.summary;
     println!(
         "cxwatch audit · static config vs usage in {} claude · {} codex · {} pi sessions",
         s.sessions_claude, s.sessions_codex, s.sessions_pi
     );
+    let auto = r.findings.iter().filter(|f| bucket(f) == 0).count();
     println!(
-        "  units {} · findings {} · ≈{} tok flagged (per-unit costs; always-loaded units cost this every session)",
+        "  units {} · findings {} ({auto} auto-fixable) · ≈{} tok flagged (per-unit costs; always-loaded units cost this every session)",
         s.units,
         s.findings,
         tok_fmt(s.tokens_flagged)
@@ -1041,17 +1060,29 @@ pub(crate) fn human(r: &EstateReport) {
     if r.findings.is_empty() {
         println!("  ✔ config is clean");
     }
-    for f in &r.findings {
-        println!(
-            "  {:<20} {:>7} {:>5}  {}: {} → {}",
-            f.rule,
-            tok_or_unknown(f.tokens),
-            format!("{}×", f.uses),
-            f.unit,
-            f.detail,
-            f.action
-        );
-        println!("      fix: {}", f.fix);
+    for (b, label) in BUCKET_LABELS {
+        let group: Vec<_> = r.findings.iter().filter(|f| bucket(f) == b).collect();
+        if group.is_empty() {
+            continue;
+        }
+        println!("  {label}:");
+        for f in group {
+            let cost = if f.rule == "dead-mcp" {
+                "per-turn".into()
+            } else {
+                tok_or_unknown(f.tokens)
+            };
+            println!(
+                "    {:<20} {:>8} {:>5}  {}: {} → {}",
+                f.rule,
+                cost,
+                format!("{}×", f.uses),
+                f.unit,
+                f.detail,
+                f.action
+            );
+            println!("        fix: {}", f.fix);
+        }
     }
     if let Some(sem) = &r.semantic {
         println!("  semantic ({}):", sem.model_used);
@@ -1086,16 +1117,16 @@ pub(crate) const GROUPS: [(&str, &str); 10] = [
 
 pub(crate) fn markdown(r: &EstateReport) -> String {
     let s = &r.summary;
+    let auto = r.findings.iter().filter(|f| bucket(f) == 0).count();
     let mut md = format!(
         "# cxwatch audit fix report\n\n\
-         - Sessions scanned: {} claude · {} codex · {} pi\n- Units audited: {}\n- Fixes: {}\n- Tokens flagged: ~{}\n\n\
+         - Sessions scanned: {} claude · {} codex · {} pi\n- Units audited: {}\n- Fixes: {} ({auto} mechanical — `cxwatch audit --fix` applies them)\n- Tokens flagged: ~{}\n\n\
          ## For the executing agent\n\n\
          You are cleaning up an AI coding agent's static context. Work through the checklists below top to\n\
          bottom; each item states its own concrete fix. Tick items off as you go. Anything involving a\n\
          deletion or config edit: show the user exactly what you are about to change and get confirmation\n\
          first. Do not touch anything not listed here. When finished, summarize what was applied and what\n\
-         was skipped.\n\n\
-         ## Fixes\n\n",
+         was skipped.\n\n",
         s.sessions_claude,
         s.sessions_codex,
         s.sessions_pi,
@@ -1103,30 +1134,53 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
         s.findings,
         tok_fmt(s.tokens_flagged)
     );
-    for (rule, heading) in GROUPS {
-        let group: Vec<_> = r.findings.iter().filter(|f| f.rule == rule).collect();
-        if group.is_empty() {
+    for (b, bucket_heading, note) in [
+        (
+            0usize,
+            "Apply now",
+            "Mechanical fixes. `cxwatch audit --fix` applies each one after a confirmation, with backups under the cxwatch trash.",
+        ),
+        (
+            1,
+            "Review",
+            "One manual edit each; every item states the exact change.",
+        ),
+        (
+            2,
+            "Informational",
+            "Weak signal (e.g. references to expired paths). Act only if it bothers you.",
+        ),
+    ] {
+        let in_bucket: Vec<_> = r.findings.iter().filter(|f| bucket(f) == b).collect();
+        if in_bucket.is_empty() {
             continue;
         }
-        let saved: usize = group.iter().map(|f| f.tokens).sum();
-        let saved_note = if saved > 0 {
-            format!(", ~{} tok", tok_fmt(saved))
-        } else {
-            String::new()
-        };
-        md.push_str(&format!("### {heading} ({}{saved_note})\n\n", group.len()));
-        for f in group {
-            let tok_note = if f.tokens > 0 {
-                format!(" [~{} tok]", tok_fmt(f.tokens))
+        md.push_str(&format!("## {bucket_heading}\n\n{note}\n\n"));
+        for (rule, heading) in GROUPS {
+            let group: Vec<_> = in_bucket.iter().filter(|f| f.rule == rule).collect();
+            if group.is_empty() {
+                continue;
+            }
+            let saved: usize = group.iter().map(|f| f.tokens).sum();
+            let saved_note = if saved > 0 {
+                format!(", ~{} tok", tok_fmt(saved))
             } else {
                 String::new()
             };
-            md.push_str(&format!(
-                "- [ ] **{}**{tok_note}: {}\n      - why: {}\n      - file: `{}`\n",
-                f.unit, f.fix, f.detail, f.path
-            ));
+            md.push_str(&format!("### {heading} ({}{saved_note})\n\n", group.len()));
+            for f in group {
+                let tok_note = if f.tokens > 0 {
+                    format!(" [~{} tok]", tok_fmt(f.tokens))
+                } else {
+                    String::new()
+                };
+                md.push_str(&format!(
+                    "- [ ] **{}**{tok_note}: {}\n      - why: {}\n      - file: `{}`\n",
+                    f.unit, f.fix, f.detail, f.path
+                ));
+            }
+            md.push('\n');
         }
-        md.push('\n');
     }
     if !r.blocks.is_empty() {
         md.push_str("## Always-loaded instruction blocks (priced per heading)\n\n| file | block | tokens |\n|---|---|---|\n");
