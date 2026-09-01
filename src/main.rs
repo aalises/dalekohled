@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub(crate) const REPORT_VERSION: u8 = 2;
+pub(crate) const REPORT_VERSION: u8 = 3;
 const THINKING_THRESHOLD: usize = 2_000;
 const OUTPUT_THRESHOLD: usize = 2_500;
 pub(crate) const DEFAULT_SEMANTIC_MODEL: &str = "moonshotai/kimi-k3";
@@ -689,7 +689,7 @@ pub(crate) fn estimate_tokens(text: &str) -> usize {
     }
 }
 
-fn text_of(content: &Value) -> String {
+pub(crate) fn text_of(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
         Value::Array(a) => a
@@ -801,7 +801,10 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
                 event_idx: op.idx,
                 event_id: op.id.clone(),
                 detail: format!("{} re-read at #{}", op.path, r.idx),
-                fix: format!("drop this copy; the read at #{} is the live one", r.idx),
+                fix: format!(
+                    "drop this copy from the conversation; the read at #{} is the live one",
+                    r.idx
+                ),
                 tokens,
             });
             flagged.insert(&op.call_id);
@@ -811,7 +814,10 @@ pub(crate) fn analyze(events: &[Event]) -> Vec<Finding> {
                 event_idx: op.idx,
                 event_id: op.id.clone(),
                 detail: format!("{} edited at #{}, no longer matches disk", op.path, m.idx),
-                fix: format!("drop it and re-read {} before relying on it", op.path),
+                fix: format!(
+                    "drop this copy from the conversation and re-read {} when needed; the file on disk is not affected",
+                    op.path
+                ),
                 tokens,
             });
             flagged.insert(&op.call_id);
@@ -1060,6 +1066,11 @@ fn human(r: &Report) {
         tok_fmt(s.reclaimable_tokens),
         s.reclaimable_pct
     );
+    if !r.findings.is_empty() {
+        println!(
+            "  findings name copies inside the conversation to drop at the next compaction — never files on disk"
+        );
+    }
     for f in &r.findings {
         println!(
             "  {:<16} {:>8}  #{:<5} {}",
@@ -1103,7 +1114,8 @@ pub(crate) fn markdown(r: &Report) -> String {
         md.push_str(
             "## For the executing agent\n\n\
              You are reclaiming context in an AI coding agent's session. History cannot be edited in\n\
-             place, so apply each fix at the next compaction, summary, or restart. Work top to bottom;\n\
+             place, so apply each fix at the next compaction, summary, or restart. Every finding names\n\
+             a copy inside the conversation; never delete or modify files on disk. Work top to bottom;\n\
              findings are sorted by token cost. Do not drop anything not listed here. When finished,\n\
              summarize what was reclaimed.\n\n\
              ## Findings\n\n",

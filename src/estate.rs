@@ -11,6 +11,11 @@ const GRACE_DAYS: u64 = 14;
 const STALE_DAYS: u64 = 120;
 const HOOK_TAX_MIN_TOKENS: usize = 500;
 const HEAVY_BLOCK_TOKENS: usize = 400;
+const LONG_SESSION_TOKENS: usize = 150_000;
+const CMD_DENY_MIN: usize = 3;
+const CMD_FAIL_MIN: usize = 3;
+const DIRECTIVE_MIN_SESSIONS: usize = 3;
+const DENIAL_MARKER: &str = "doesn't want to proceed";
 
 #[derive(Serialize, Clone)]
 pub(crate) struct EstateFinding {
@@ -45,13 +50,27 @@ pub(crate) struct Block {
 }
 
 #[derive(Serialize, Clone)]
+pub(crate) struct SessionStat {
+    pub harness: &'static str,
+    pub sessions: usize,
+    pub median_tokens: usize,
+    pub p90_tokens: usize,
+    pub over_long: usize,
+}
+
+#[derive(Serialize, Clone)]
 pub(crate) struct EstateReport {
     pub version: u8,
     pub findings: Vec<EstateFinding>,
     /// Always-loaded instruction files priced per heading block.
     pub blocks: Vec<Block>,
+    /// Rough per-harness session size distribution; only harnesses with sessions.
+    pub session_stats: Vec<SessionStat>,
     /// Positive usage counts, for JSON consumers and the semantic digest.
     pub usage: Vec<String>,
+    /// Short user messages observed across sessions ("N× text"), for JSON
+    /// consumers and the semantic paraphrase pass.
+    pub directives: Vec<String>,
     pub semantic: Option<Semantic>,
     pub summary: EstateSummary,
 }
@@ -72,6 +91,31 @@ enum Harness {
     Pi,
 }
 
+impl Harness {
+    fn idx(self) -> usize {
+        match self {
+            Harness::Claude => 0,
+            Harness::Codex => 1,
+            Harness::Pi => 2,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CmdStat {
+    runs: usize,
+    fails: usize,   // is_error results that are not permission denials
+    denials: usize, // permission-denied results
+    fail_tokens: usize,
+    sample: String, // one failing invocation, first line
+}
+
+#[derive(Default)]
+struct DirectiveStat {
+    sessions: usize, // distinct sessions the message was typed in
+    sample: String,  // original casing
+}
+
 #[derive(Default)]
 struct Usage {
     claude_sessions: usize,
@@ -85,6 +129,9 @@ struct Usage {
     skill_reads_claude: HashMap<String, usize>,
     skill_reads_codex: HashMap<String, usize>,
     skill_reads_pi: HashMap<String, usize>,
+    bash: HashMap<String, CmdStat>, // per command head, claude only
+    directives: HashMap<String, DirectiveStat>, // normalized short user messages, claude only
+    session_toks: [Vec<usize>; 3],  // rough tokens per session, indexed by Harness::idx
 }
 
 fn scan_usage(home: &Path) -> Usage {
@@ -109,6 +156,7 @@ fn scan_usage(home: &Path) -> Usage {
 }
 
 fn count_transcript(hay: &str, harness: Harness, usage: &mut Usage) {
+    usage.session_toks[harness.idx()].push(token_estimate(hay));
     match harness {
         Harness::Claude => {
             usage.claude_sessions += 1;
@@ -127,6 +175,8 @@ fn count_transcript(hay: &str, harness: Harness, usage: &mut Usage) {
             );
             count_mcp(hay, &mut usage.mcp_claude);
             count_hooks(hay, &mut usage.hooks);
+            count_bash_outcomes(hay, &mut usage.bash);
+            count_directives(hay, &mut usage.directives);
         }
         Harness::Codex => {
             usage.codex_sessions += 1;
@@ -235,6 +285,164 @@ fn count_skill_reads(hay: &str, map: &mut HashMap<String, usize>) {
     }
 }
 
+/// Rough per-session token estimate from the content-bearing JSON string
+/// fields. Transcript formats duplicate result text (in-message plus a
+/// line-level copy), so this divides by 8 instead of chars/4; calibrated
+/// against the o200k-based session audit (within ~±20%).
+fn token_estimate(hay: &str) -> usize {
+    let mut chars = 0usize;
+    for pat in [
+        "\"text\":\"",
+        "\"thinking\":\"",
+        "\"content\":\"",
+        "\"output\":\"",
+    ] {
+        for (i, _) in hay.match_indices(pat) {
+            chars += escaped_len(&hay[i + pat.len()..]);
+        }
+    }
+    chars / 8
+}
+
+/// Normalize a shell command to a stable head ("git push", "rg"), skipping a
+/// leading `cd dir &&`.
+fn command_head(cmd: &str) -> String {
+    let cmd = cmd.trim_start();
+    let cmd = if cmd.starts_with("cd ") {
+        cmd.split_once("&&")
+            .map(|(_, r)| r.trim_start())
+            .unwrap_or(cmd)
+    } else {
+        cmd
+    };
+    let mut toks = cmd.split_whitespace();
+    let first = toks.next().unwrap_or("?").to_string();
+    const WITH_SUBCOMMAND: [&str; 12] = [
+        "git", "cargo", "npm", "pnpm", "yarn", "docker", "kubectl", "gh", "go", "uv", "brew",
+        "make",
+    ];
+    if WITH_SUBCOMMAND.contains(&first.as_str())
+        && let Some(second) = toks.next()
+        && !second.starts_with('-')
+    {
+        return format!("{first} {second}");
+    }
+    first
+}
+
+/// Pair Bash tool calls with their results and record failures and
+/// permission denials per command head (claude transcripts only).
+fn count_bash_outcomes(hay: &str, map: &mut HashMap<String, CmdStat>) {
+    let mut pending: HashMap<String, (String, String)> = HashMap::new(); // call id -> (head, command)
+    for line in hay.lines() {
+        if !line.contains("\"name\":\"Bash\"") && !line.contains("\"tool_use_id\":") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(items) = v["message"]["content"].as_array() else {
+            continue;
+        };
+        for item in items {
+            match item["type"].as_str() {
+                Some("tool_use") if item["name"] == "Bash" => {
+                    if let (Some(id), Some(cmd)) =
+                        (item["id"].as_str(), item["input"]["command"].as_str())
+                    {
+                        let head = command_head(cmd);
+                        map.entry(head.clone()).or_default().runs += 1;
+                        pending.insert(id.to_string(), (head, cmd.to_string()));
+                    }
+                }
+                Some("tool_result") => {
+                    let Some((head, cmd)) = item["tool_use_id"]
+                        .as_str()
+                        .and_then(|id| pending.remove(id))
+                    else {
+                        continue;
+                    };
+                    if item["is_error"].as_bool() != Some(true) {
+                        continue;
+                    }
+                    let text = crate::text_of(&item["content"]);
+                    let stat = map.entry(head).or_default();
+                    if text.contains(DENIAL_MARKER) {
+                        stat.denials += 1;
+                    } else {
+                        stat.fails += 1;
+                        stat.fail_tokens += crate::estimate_tokens(&text);
+                        if stat.sample.is_empty() {
+                            stat.sample = crate::clip(cmd.lines().next().unwrap_or(&cmd), 80);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Short instructions the user typed themselves, counted once per session
+/// (claude transcripts only). Excludes slash-command wrappers, pasted output,
+/// sidechains, and bare acknowledgements.
+fn count_directives(hay: &str, map: &mut HashMap<String, DirectiveStat>) {
+    const ACK_WORDS: [&str; 18] = [
+        "yes", "no", "ok", "okay", "sure", "thanks", "thank", "great", "perfect", "nice", "cool",
+        "lgtm", "go", "continue", "proceed", "done", "stop", "wait",
+    ];
+    let mut seen = HashSet::new();
+    for line in hay.lines() {
+        if !line.contains("\"type\":\"user\"") || line.contains("tool_result") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["isSidechain"].as_bool() == Some(true) || v["message"]["role"] != "user" {
+            continue;
+        }
+        let Some(text) = v["message"]["content"].as_str() else {
+            continue;
+        };
+        let text = text.trim();
+        if text.len() < 12
+            || text.len() > 240
+            || text.contains('\n')
+            || text.starts_with(['<', '['])
+        {
+            continue;
+        }
+        let norm = text
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let words = norm.split(' ').count();
+        if words < 3 || ACK_WORDS.contains(&norm.split(' ').next().unwrap_or("")) {
+            continue;
+        }
+        if !seen.insert(norm.clone()) {
+            continue;
+        }
+        let e = map.entry(norm).or_default();
+        e.sessions += 1;
+        if e.sample.is_empty() {
+            e.sample = text.to_string();
+        }
+    }
+}
+
+fn percentile(sorted: &[usize], pct: usize) -> usize {
+    if sorted.is_empty() {
+        return 0;
+    }
+    sorted[(sorted.len() - 1) * pct / 100]
+}
+
 /// Length of a JSON string body starting right after its opening quote.
 fn escaped_len(s: &str) -> usize {
     let b = s.as_bytes();
@@ -286,7 +494,10 @@ pub(crate) fn audit() -> EstateReport {
             // file reads are not the harness mechanism here (unlike codex/pi)
             let uses = usage.skills.get(&name).copied().unwrap_or(0)
                 + usage.commands.get(&name).copied().unwrap_or(0);
-            if uses == 0 && age_days(now, md.modified().ok()) > GRACE_DAYS {
+            if usage.claude_sessions > 0
+                && uses == 0
+                && age_days(now, md.modified().ok()) > GRACE_DAYS
+            {
                 let reads = usage.skill_reads_claude.get(&name).copied().unwrap_or(0);
                 let reads_note = if reads > 0 {
                     format!(" ({reads} raw file reads observed, hooks or manual)")
@@ -361,7 +572,8 @@ pub(crate) fn audit() -> EstateReport {
                 .unwrap_or("")
                 .to_string();
             units += 1;
-            if usage.commands.get(&name).copied().unwrap_or(0) == 0
+            if usage.claude_sessions > 0
+                && usage.commands.get(&name).copied().unwrap_or(0) == 0
                 && age_days(now, md.modified().ok()) > GRACE_DAYS
             {
                 findings.push(EstateFinding {
@@ -421,7 +633,6 @@ pub(crate) fn audit() -> EstateReport {
         }
     }
     for (name, harness, scope) in &servers {
-        units += 1;
         let (own, other, other_label, sessions) = if *harness == "claude" {
             (
                 &usage.mcp_claude,
@@ -437,6 +648,11 @@ pub(crate) fn audit() -> EstateReport {
                 usage.codex_sessions,
             )
         };
+        // no sessions of the harness = no evidence; say nothing about it
+        if sessions == 0 {
+            continue;
+        }
+        units += 1;
         if uses_of(own, name) == 0 {
             let cross = uses_of(other, name);
             let cross_note = if cross > 0 {
@@ -684,6 +900,111 @@ pub(crate) fn audit() -> EstateReport {
         }
     }
 
+    // interaction: shell commands that keep getting denied or keep failing
+    for (head, stat) in &usage.bash {
+        if stat.denials >= CMD_DENY_MIN {
+            findings.push(EstateFinding {
+                rule: "blocked-command",
+                unit: format!("bash `{head}`"),
+                path: home.join(".claude/settings.json").display().to_string(),
+                fix: format!(
+                    "if `{head}` should be allowed, add \"Bash({head}:*)\" to permissions.allow in ~/.claude/settings.json (or use /permissions); otherwise tell the agent not to reach for it"
+                ),
+                tokens: 0,
+                uses: stat.denials,
+                detail: format!(
+                    "permission-denied {}× across {} claude sessions; every denial stalls the agent mid-task",
+                    stat.denials, usage.claude_sessions
+                ),
+                action: "allow or steer away",
+            });
+        }
+        if stat.fails >= CMD_FAIL_MIN && stat.fails * 2 >= stat.runs {
+            findings.push(EstateFinding {
+                rule: "failing-command",
+                unit: format!("bash `{head}`"),
+                path: home.join(".claude/CLAUDE.md").display().to_string(),
+                fix: format!(
+                    "find out why `{head}` keeps failing (e.g. `{}`); fix the environment or record the working invocation in ~/.claude/CLAUDE.md",
+                    stat.sample
+                ),
+                tokens: stat.fail_tokens,
+                uses: stat.runs,
+                detail: format!(
+                    "failed {} of {} runs across claude sessions; each failure pays for the error output plus a retry",
+                    stat.fails, stat.runs
+                ),
+                action: "unbreak",
+            });
+        }
+    }
+
+    // interaction: instructions the user retypes session after session
+    for stat in usage.directives.values() {
+        if stat.sessions >= DIRECTIVE_MIN_SESSIONS {
+            findings.push(EstateFinding {
+                rule: "repeated-directive",
+                unit: format!("directive \"{}\"", crate::clip(&stat.sample, 48)),
+                path: home.join(".claude/CLAUDE.md").display().to_string(),
+                fix: format!(
+                    "add it to ~/.claude/CLAUDE.md so it is loaded every session: `{}`",
+                    stat.sample.replace('`', "'")
+                ),
+                tokens: crate::estimate_tokens(&stat.sample) * stat.sessions,
+                uses: stat.sessions,
+                detail: format!(
+                    "typed in {} of {} claude sessions; standing instructions belong in CLAUDE.md, not in every conversation",
+                    stat.sessions, usage.claude_sessions
+                ),
+                action: "promote",
+            });
+        }
+    }
+
+    // interaction: session size distribution per harness
+    let mut session_stats = Vec::new();
+    for (i, (label, sessions_root)) in [
+        ("claude", ".claude/projects"),
+        ("codex", ".codex/sessions"),
+        ("pi", ".pi/agent/sessions"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut toks = usage.session_toks[i].clone();
+        if toks.is_empty() {
+            continue;
+        }
+        toks.sort_unstable();
+        let over = toks.iter().filter(|t| **t > LONG_SESSION_TOKENS).count();
+        let stat = SessionStat {
+            harness: label,
+            sessions: toks.len(),
+            median_tokens: percentile(&toks, 50),
+            p90_tokens: percentile(&toks, 90),
+            over_long: over,
+        };
+        if over >= 2 && over * 4 >= stat.sessions {
+            findings.push(EstateFinding {
+                rule: "long-sessions",
+                unit: format!("{label} sessions"),
+                path: home.join(sessions_root).display().to_string(),
+                fix: "start a fresh session per task and hand context over explicitly (a plan file or summary) instead of carrying the whole history".into(),
+                tokens: 0,
+                uses: over,
+                detail: format!(
+                    "{over} of {} sessions exceed ~{} tok (median ~{}, p90 ~{}); past a point, extra history dilutes attention and raises cost",
+                    stat.sessions,
+                    tok_fmt(LONG_SESSION_TOKENS),
+                    tok_fmt(stat.median_tokens),
+                    tok_fmt(stat.p90_tokens)
+                ),
+                action: "split work",
+            });
+        }
+        session_stats.push(stat);
+    }
+
     findings.sort_by(|a, b| {
         rank(a.rule)
             .cmp(&rank(b.rule))
@@ -712,6 +1033,20 @@ pub(crate) fn audit() -> EstateReport {
         .map(|(n, s)| (n.clone(), s.sample.clone()))
         .collect();
 
+    // repeated-or-notable user messages, most-repeated first, for the
+    // semantic paraphrase pass and JSON consumers
+    let mut directives: Vec<(&usize, &String)> = usage
+        .directives
+        .values()
+        .map(|d| (&d.sessions, &d.sample))
+        .collect();
+    directives.sort_by(|a, b| b.0.cmp(a.0).then(a.1.cmp(b.1)));
+    let directives: Vec<String> = directives
+        .into_iter()
+        .take(120)
+        .map(|(n, s)| format!("{n}× {s}"))
+        .collect();
+
     let tokens_flagged = findings.iter().map(|f| f.tokens).sum();
     let mut report = EstateReport {
         version: crate::REPORT_VERSION,
@@ -725,7 +1060,9 @@ pub(crate) fn audit() -> EstateReport {
         },
         findings,
         blocks,
+        session_stats,
         usage: used,
+        directives,
         semantic: None,
     };
     report.usage.extend(
@@ -747,6 +1084,10 @@ fn push_harness_skill(
     findings: &mut Vec<EstateFinding>,
     now: SystemTime,
 ) {
+    // no sessions of the harness = no evidence; say nothing about it
+    if sessions == 0 {
+        return;
+    }
     let name = skill_md
         .parent()
         .and_then(|p| p.file_name())
@@ -1000,16 +1341,20 @@ pub(crate) fn semantic_pass(report: &EstateReport) -> Result<Semantic> {
             }
         }
     }
+    if !report.directives.is_empty() {
+        digest.push_str("\n--- short user messages across sessions (count× text) ---\n");
+        digest.push_str(&report.directives.join("\n"));
+        digest.push('\n');
+    }
     let digest = crate::cap_middle(digest, 50_000);
     let prompt = format!(
         "You are auditing an AI coding agent's static context (global instructions, skills, memory files, hook payloads) for waste.\n\
          Find CONTRADICTIONS (directives that conflict with each other, with themselves, or with the observed usage stats) \
-         and DUPLICATION (the same guidance stated in multiple places). Cite source names. Be specific.\n\n\
+         and DUPLICATION (the same guidance stated in multiple places; also instructions the user keeps typing in sessions, \
+         verbatim or paraphrased, that belong in CLAUDE.md — propose the exact line to add). Cite source names. Be specific.\n\n\
          CONTRADICTIONS:\n- <list>\n\nDUPLICATION:\n- <list>\n\n\
-         Observed usage ({} claude / {} codex / {} pi sessions):\n{}\n\nContext sources:\n{}",
-        report.summary.sessions_claude,
-        report.summary.sessions_codex,
-        report.summary.sessions_pi,
+         Observed usage ({}):\n{}\n\nContext sources:\n{}",
+        harness_counts(&report.summary),
         report.usage.join("\n"),
         digest
     );
@@ -1026,11 +1371,29 @@ pub(crate) fn tok_or_unknown(tokens: usize) -> String {
     }
 }
 
+/// "42 claude · 7 pi sessions" — harnesses with no sessions are not mentioned.
+fn harness_counts(s: &EstateSummary) -> String {
+    let parts: Vec<String> = [
+        (s.sessions_claude, "claude"),
+        (s.sessions_codex, "codex"),
+        (s.sessions_pi, "pi"),
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, label)| format!("{n} {label}"))
+    .collect();
+    if parts.is_empty() {
+        "no local sessions".into()
+    } else {
+        format!("{} sessions", parts.join(" · "))
+    }
+}
+
 pub(crate) fn human(r: &EstateReport) {
     let s = &r.summary;
     println!(
-        "cxwatch audit · static config vs usage in {} claude · {} codex · {} pi sessions",
-        s.sessions_claude, s.sessions_codex, s.sessions_pi
+        "cxwatch audit · static config vs usage in {}",
+        harness_counts(s)
     );
     println!(
         "  units {} · findings {} · ≈{} tok flagged (per-unit costs; always-loaded units cost this every session)",
@@ -1038,6 +1401,16 @@ pub(crate) fn human(r: &EstateReport) {
         s.findings,
         tok_fmt(s.tokens_flagged)
     );
+    for st in &r.session_stats {
+        println!(
+            "  {} sessions: median ≈{} tok · p90 ≈{} tok · {} over ≈{} tok",
+            st.harness,
+            tok_fmt(st.median_tokens),
+            tok_fmt(st.p90_tokens),
+            st.over_long,
+            tok_fmt(LONG_SESSION_TOKENS)
+        );
+    }
     if r.findings.is_empty() {
         println!("  ✔ config is clean");
     }
@@ -1071,13 +1444,23 @@ pub(crate) fn human(r: &EstateReport) {
     }
 }
 
-pub(crate) const GROUPS: [(&str, &str); 10] = [
+pub(crate) const GROUPS: [(&str, &str); 14] = [
     ("dead-mcp", "Disable unused MCP servers"),
     ("dead-skill", "Delete or demote dead skills"),
+    (
+        "repeated-directive",
+        "Promote repeated instructions into CLAUDE.md",
+    ),
+    (
+        "blocked-command",
+        "Allow or steer away from repeatedly denied commands",
+    ),
+    ("failing-command", "Unbreak repeatedly failing commands"),
     ("duplicate-directive", "Merge duplicated directives"),
     ("heavy-block", "Tighten heavy instruction blocks"),
     ("hook-tax", "Slim hook payloads"),
     ("dead-command", "Delete unused commands"),
+    ("long-sessions", "Split long sessions"),
     ("orphan-memory", "Repair memory indexes: orphaned files"),
     ("dangling-index", "Repair memory indexes: dangling entries"),
     ("stale-ref", "Fix stale references"),
@@ -1088,7 +1471,7 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
     let s = &r.summary;
     let mut md = format!(
         "# cxwatch audit fix report\n\n\
-         - Sessions scanned: {} claude · {} codex · {} pi\n- Units audited: {}\n- Fixes: {}\n- Tokens flagged: ~{}\n\n\
+         - Sessions scanned: {}\n- Units audited: {}\n- Fixes: {}\n- Tokens flagged: ~{}\n\n\
          ## For the executing agent\n\n\
          You are cleaning up an AI coding agent's static context. Work through the checklists below top to\n\
          bottom; each item states its own concrete fix. Tick items off as you go. Anything involving a\n\
@@ -1096,9 +1479,7 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
          first. Do not touch anything not listed here. When finished, summarize what was applied and what\n\
          was skipped.\n\n\
          ## Fixes\n\n",
-        s.sessions_claude,
-        s.sessions_codex,
-        s.sessions_pi,
+        harness_counts(s),
         s.units,
         s.findings,
         tok_fmt(s.tokens_flagged)
@@ -1124,6 +1505,23 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
             md.push_str(&format!(
                 "- [ ] **{}**{tok_note}: {}\n      - why: {}\n      - file: `{}`\n",
                 f.unit, f.fix, f.detail, f.path
+            ));
+        }
+        md.push('\n');
+    }
+    if !r.session_stats.is_empty() {
+        md.push_str(&format!(
+            "## Session size (rough estimates)\n\n| harness | sessions | median | p90 | over ~{} |\n|---|---|---|---|---|\n",
+            tok_fmt(LONG_SESSION_TOKENS)
+        ));
+        for st in &r.session_stats {
+            md.push_str(&format!(
+                "| {} | {} | ~{} | ~{} | {} |\n",
+                st.harness,
+                st.sessions,
+                tok_fmt(st.median_tokens),
+                tok_fmt(st.p90_tokens),
+                st.over_long
             ));
         }
         md.push('\n');
@@ -1212,6 +1610,13 @@ pub(crate) fn fix_op(f: &EstateFinding) -> FixOp {
                 }
             }
         }
+        "repeated-directive" => match backticked(&f.fix) {
+            Some(line) => FixOp::AppendLine {
+                file: f.path.clone(),
+                line,
+            },
+            None => FixOp::Manual,
+        },
         "orphan-memory" => match backticked(&f.fix) {
             Some(line) => FixOp::AppendLine {
                 file: Path::new(&f.path)
@@ -1650,6 +2055,171 @@ mod tests {
         assert!(commits >= 1);
         assert!(age < 36_500);
         assert!(git_stats(Path::new("/tmp/definitely-not-in-git.xyz")).is_none());
+    }
+
+    #[test]
+    fn command_head_normalization() {
+        assert_eq!(command_head("git push origin main"), "git push");
+        assert_eq!(command_head("git -C /x log"), "git");
+        assert_eq!(command_head("cd /repo && cargo test --all"), "cargo test");
+        assert_eq!(command_head("rg foo src/"), "rg");
+        assert_eq!(command_head(""), "?");
+    }
+
+    fn bash_call(id: &str, cmd: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"{cmd}"}}}}]}}}}"#
+        )
+    }
+
+    fn bash_result(id: &str, text: &str, is_error: bool) -> String {
+        format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"{text}","is_error":{is_error}}}]}}}}"#
+        )
+    }
+
+    #[test]
+    fn bash_outcomes_split_denials_from_failures() {
+        let hay = [
+            bash_call("t1", "git push origin main"),
+            bash_result(
+                "t1",
+                "The user doesn't want to proceed with this tool use.",
+                true,
+            ),
+            bash_call("t2", "git push --tags"),
+            bash_result("t2", "fatal: remote error", true),
+            bash_call("t3", "git push"),
+            bash_result("t3", "Everything up-to-date", false),
+        ]
+        .join("\n");
+        let mut map = HashMap::new();
+        count_bash_outcomes(&hay, &mut map);
+        let stat = &map["git push"];
+        assert_eq!(stat.runs, 3);
+        assert_eq!(stat.denials, 1);
+        assert_eq!(stat.fails, 1);
+        assert!(stat.fail_tokens > 0);
+        assert!(stat.sample.contains("--tags"));
+    }
+
+    fn user_msg(text: &str, sidechain: bool) -> String {
+        format!(
+            r#"{{"type":"user","isSidechain":{sidechain},"message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    #[test]
+    fn directives_counted_once_per_session_with_exclusions() {
+        let session = [
+            user_msg("use simple language", false),
+            user_msg("Use simple language!", false), // same session, same norm: not double counted
+            user_msg("yes go ahead", false),         // acknowledgement
+            user_msg("do the thing", true),          // sidechain
+            user_msg("<command-name>/mcp</command-name>", false), // slash command wrapper
+            user_msg("fix it", false),               // too short
+        ]
+        .join("\n");
+        let mut map = HashMap::new();
+        count_directives(&session, &mut map);
+        count_directives(&session, &mut map); // second session
+        assert_eq!(map.len(), 1);
+        let stat = &map["use simple language"];
+        assert_eq!(stat.sessions, 2);
+        assert_eq!(stat.sample, "use simple language");
+    }
+
+    #[test]
+    fn token_estimate_counts_content_fields() {
+        // 16 content chars across two fields -> 16/8 = 2
+        assert_eq!(
+            token_estimate(r#"{"text":"aaaaaaaa","content":"bbbbbbbb","other":"ignored"}"#),
+            2
+        );
+        assert_eq!(token_estimate("no json here"), 0);
+    }
+
+    #[test]
+    fn percentile_bounds() {
+        assert_eq!(percentile(&[], 50), 0);
+        assert_eq!(percentile(&[7], 90), 7);
+        assert_eq!(percentile(&[1, 2, 3, 4, 100], 50), 3);
+        assert_eq!(percentile(&[1, 2, 3, 4, 100], 100), 100);
+    }
+
+    #[test]
+    fn harness_with_no_sessions_is_never_mentioned() {
+        let mut s = EstateSummary {
+            sessions_claude: 42,
+            sessions_codex: 0,
+            sessions_pi: 0,
+            units: 0,
+            findings: 0,
+            tokens_flagged: 0,
+        };
+        assert_eq!(harness_counts(&s), "42 claude sessions");
+        s.sessions_pi = 7;
+        assert_eq!(harness_counts(&s), "42 claude · 7 pi sessions");
+        s.sessions_claude = 0;
+        s.sessions_pi = 0;
+        assert_eq!(harness_counts(&s), "no local sessions");
+    }
+
+    #[test]
+    fn harness_skill_needs_session_evidence() {
+        let dir = std::env::temp_dir().join(format!("cxwatch-skill-test-{}", std::process::id()));
+        let skill = dir.join("skills/foo");
+        std::fs::create_dir_all(&skill).unwrap();
+        let md = skill.join("SKILL.md");
+        std::fs::write(&md, "guidance").unwrap();
+        // a future "now" makes the fresh file look past the grace period
+        let now = SystemTime::now() + std::time::Duration::from_secs(100 * 86_400);
+        let reads = HashMap::new();
+        let mut findings = Vec::new();
+        let mut units = 0;
+        let mut seen = HashSet::new();
+        push_harness_skill(
+            &md,
+            "codex",
+            0,
+            &reads,
+            &mut seen,
+            &mut units,
+            &mut findings,
+            now,
+        );
+        assert!(findings.is_empty(), "no sessions means no finding");
+        assert_eq!(units, 0);
+        push_harness_skill(
+            &md,
+            "codex",
+            5,
+            &reads,
+            &mut seen,
+            &mut units,
+            &mut findings,
+            now,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, "dead-skill");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_directive_fix_is_mechanical() {
+        let f = finding(
+            "repeated-directive",
+            "directive \"use simple language\"",
+            "/h/.claude/CLAUDE.md",
+            "add it to ~/.claude/CLAUDE.md so it is loaded every session: `use simple language`",
+        );
+        assert_eq!(
+            fix_op(&f),
+            FixOp::AppendLine {
+                file: "/h/.claude/CLAUDE.md".into(),
+                line: "use simple language".into()
+            }
+        );
     }
 
     #[test]
