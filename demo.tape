@@ -51,10 +51,14 @@ Hide
 Type "clear"
 Enter
 Show
-Type "cxwatch audit ~/.claude/projects/-Users-demo-dev-acmeshop/*.jsonl"
+Type "cxwatch audit ~/.claude/projects/-Users-demo-dev-acmeshop/33333333-*.jsonl"
 Sleep 600ms
 Enter
 Sleep 5s
+Type "clear && cxwatch audit cursor:aaaaaaaa-0000-4000-8000-000000000001"
+Sleep 600ms
+Enter
+Sleep 4.5s
 
 # ── ③ audit your config ──
 Hide
