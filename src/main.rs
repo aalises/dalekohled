@@ -22,7 +22,7 @@ pub(crate) fn semantic_model() -> String {
 #[derive(Parser)]
 #[command(
     name = "cxwatch",
-    about = "Context hygiene for Claude Code, Codex, pi, and OpenCode sessions",
+    about = "Context hygiene for Claude Code, Codex, pi, OpenCode, and Cursor sessions",
     arg_required_else_help = true
 )]
 struct Cli {
@@ -34,7 +34,7 @@ struct Cli {
 enum Cmd {
     /// Audit a session, or your agent config across all transcripts when no session is given
     Audit {
-        /// Session to audit (file path or opencode:<id>); omit to audit static config
+        /// Session to audit (file path, opencode:<id>, or cursor:<id>); omit to audit static config
         #[arg(conflicts_with = "fix")]
         session: Option<PathBuf>,
         /// Emit JSON
@@ -82,6 +82,7 @@ pub(crate) enum Source {
     Claude,
     Codex,
     OpenCode,
+    Cursor,
 }
 
 impl Source {
@@ -91,6 +92,7 @@ impl Source {
             Source::Claude => "claude",
             Source::Codex => "codex",
             Source::OpenCode => "opencode",
+            Source::Cursor => "cursor",
         }
     }
 }
@@ -150,6 +152,7 @@ pub(crate) fn sessions() -> Vec<SessionMeta> {
         }
     }
     opencode_sessions(&mut out);
+    cursor_sessions(&mut out);
     out.sort_by_key(|session| Reverse(session.modified));
     out
 }
@@ -264,6 +267,219 @@ fn opencode_items(part: &Value) -> Vec<Item> {
     }
 }
 
+// ---------- cursor (sqlite-backed chats, addressed as "cursor:<composerId>") ----------
+
+/// Cursor's global state store. Its `cursorDiskKV` table holds one
+/// `composerData:<id>` row per conversation and one `bubbleId:<id>:<bubble>`
+/// row per turn. The hook transcripts under ~/.cursor/projects are text-only
+/// mirrors of these rows, so they are not read.
+pub(crate) fn cursor_db() -> PathBuf {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Cursor")
+    } else if cfg!(windows) {
+        std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join("AppData/Roaming"))
+            .join("Cursor")
+    } else {
+        home.join(".config/Cursor")
+    };
+    base.join("User/globalStorage/state.vscdb")
+}
+
+fn cursor_sessions(out: &mut Vec<SessionMeta>) {
+    let db = cursor_db();
+    if !db.is_file() {
+        return;
+    }
+    // only conversations that still carry their turn list; drafts and purged chats have none
+    let rows = sqlite_json(
+        &db,
+        "with bubbles as (select substr(key, 10, instr(substr(key, 10), ':') - 1) as cid, \
+         sum(length(value)) as bytes from cursorDiskKV where key like 'bubbleId:%' group by cid) \
+         select substr(c.key, 14) as id, json_extract(c.value, '$.name') as title, \
+         json_extract(c.value, '$.lastUpdatedAt') as up, coalesce(b.bytes, 0) as bytes \
+         from cursorDiskKV c left join bubbles b on b.cid = substr(c.key, 14) \
+         where c.key like 'composerData:%' and json_valid(c.value) \
+         and json_array_length(c.value, '$.fullConversationHeadersOnly') > 0",
+    );
+    for r in rows {
+        let Some(id) = r["id"].as_str() else { continue };
+        out.push(SessionMeta {
+            source: Source::Cursor,
+            path: PathBuf::from(format!("cursor:{id}")),
+            title: r["title"]
+                .as_str()
+                .filter(|t| !t.is_empty())
+                .unwrap_or("untitled")
+                .to_string(),
+            modified: SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_millis(r["up"].as_u64().unwrap_or(0)),
+            size: r["bytes"].as_u64().unwrap_or(0),
+        });
+    }
+}
+
+/// (composer id, bubble id, bubble) for a `bubbleId:<composer>:<bubble>` row.
+fn cursor_bubble_row(row: &Value) -> Option<(&str, &str, Value)> {
+    let (composer, bubble_id) = row["key"]
+        .as_str()?
+        .strip_prefix("bubbleId:")?
+        .split_once(':')?;
+    let bubble = serde_json::from_str(row["value"].as_str()?).ok()?;
+    Some((composer, bubble_id, bubble))
+}
+
+/// Every Cursor conversation as its parsed bubbles, for the config audit's usage scan.
+pub(crate) fn cursor_bubbles() -> Vec<Vec<Value>> {
+    let db = cursor_db();
+    if !db.is_file() {
+        return Vec::new();
+    }
+    let rows = sqlite_json(
+        &db,
+        "select key, value from cursorDiskKV where key like 'bubbleId:%' order by key",
+    );
+    let mut sessions: Vec<(String, Vec<Value>)> = Vec::new();
+    for row in &rows {
+        let Some((composer, _, bubble)) = cursor_bubble_row(row) else {
+            continue;
+        };
+        match sessions.last_mut() {
+            Some((id, bubbles)) if id == composer => bubbles.push(bubble),
+            _ => sessions.push((composer.to_string(), vec![bubble])),
+        }
+    }
+    sessions.into_iter().map(|(_, bubbles)| bubbles).collect()
+}
+
+fn parse_cursor(id: &str) -> Result<Vec<Event>> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        anyhow::bail!("invalid cursor session id");
+    }
+    let rows = sqlite_json(
+        &cursor_db(),
+        &format!(
+            "select key, value from cursorDiskKV \
+             where key = 'composerData:{id}' or key like 'bubbleId:{id}:%'"
+        ),
+    );
+    if rows.is_empty() {
+        anyhow::bail!("no cursor session {id} (or sqlite3 unavailable)");
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut bubbles: HashMap<String, Value> = HashMap::new();
+    for row in &rows {
+        if row["key"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("composerData:"))
+        {
+            if let Some(composer) = row["value"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            {
+                order = composer["fullConversationHeadersOnly"]
+                    .as_array()
+                    .map(|heads| {
+                        heads
+                            .iter()
+                            .filter_map(|h| h["bubbleId"].as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            }
+        } else if let Some((_, bubble_id, bubble)) = cursor_bubble_row(row) {
+            bubbles.insert(bubble_id.to_string(), bubble);
+        }
+    }
+    if order.is_empty() {
+        // no turn list: fall back to creation order
+        let mut by_time: Vec<(String, &String)> = bubbles
+            .iter()
+            .map(|(id, b)| (b["createdAt"].as_str().unwrap_or("").to_string(), id))
+            .collect();
+        by_time.sort();
+        order = by_time.into_iter().map(|(_, id)| id.clone()).collect();
+    }
+    Ok(order
+        .iter()
+        .filter_map(|bubble_id| {
+            let bubble = bubbles.get(bubble_id)?;
+            let items = cursor_items(bubble);
+            (!items.is_empty()).then(|| Event {
+                id: bubble_id.clone(),
+                role: match bubble["type"].as_u64() {
+                    Some(1) => "user".into(),
+                    Some(2) => "assistant".into(),
+                    _ => "unknown".into(),
+                },
+                items,
+            })
+        })
+        .collect())
+}
+
+/// One bubble is one turn: user text, assistant text and thinking, or a tool
+/// call whose result Cursor stores alongside it in `toolFormerData`.
+fn cursor_items(bubble: &Value) -> Vec<Item> {
+    let mut items = Vec::new();
+    if let Some(text) = bubble["text"].as_str().filter(|t| !t.is_empty()) {
+        items.push(Item::Text(text.into()));
+    }
+    if let Some(thinking) = bubble["thinking"]["text"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+    {
+        items.push(Item::Thinking(thinking.into()));
+    }
+    let tool = &bubble["toolFormerData"];
+    if let Some(name) = tool["name"].as_str() {
+        let call_id = tool["toolCallId"]
+            .as_str()
+            .or(bubble["bubbleId"].as_str())
+            .unwrap_or("")
+            .to_string();
+        items.push(tool_call_item(call_id.clone(), name, &cursor_args(tool)));
+        items.push(Item::ToolResult {
+            call_id,
+            tokens: estimate_tokens(&cursor_result_text(tool)),
+        });
+    }
+    items
+}
+
+/// `rawArgs` is the model's own JSON (or the raw patch text for apply_patch);
+/// `params` is Cursor's normalized copy and fills in keys the model omitted.
+pub(crate) fn cursor_args(tool: &Value) -> Value {
+    let raw = tool["rawArgs"].as_str().unwrap_or("");
+    let mut args = match serde_json::from_str::<Value>(raw) {
+        Ok(v) if v.is_object() => v,
+        _ if raw.is_empty() => serde_json::json!({}),
+        _ => serde_json::json!({ "input": raw }),
+    };
+    if let Ok(Value::Object(params)) =
+        serde_json::from_str::<Value>(tool["params"].as_str().unwrap_or(""))
+        && let Some(obj) = args.as_object_mut()
+    {
+        for (k, v) in params {
+            obj.entry(k).or_insert(v);
+        }
+    }
+    args
+}
+
+/// Results are JSON-encoded strings; the model-facing text sits under a
+/// tool-specific key (reads: contents, shells: output, edits: resultForModel).
+pub(crate) fn cursor_result_text(tool: &Value) -> String {
+    let raw = tool["result"].as_str().unwrap_or("");
+    let parsed: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    ["contents", "output", "resultForModel"]
+        .iter()
+        .find_map(|k| parsed[*k].as_str())
+        .map_or_else(|| raw.to_string(), String::from)
+}
+
 fn title_for(source: Source, path: &Path) -> String {
     let parent = path
         .parent()
@@ -274,7 +490,7 @@ fn title_for(source: Source, path: &Path) -> String {
         // dir name encodes the cwd, e.g. "--Users-me-dev-cxwatch--" / "-Users-me-dev-cxwatch"
         Source::Pi | Source::Claude => decode_slug(parent),
         // listed straight from the db, never via file walk
-        Source::OpenCode => String::new(),
+        Source::OpenCode | Source::Cursor => String::new(),
         // filename: rollout-<date>T<time>-<uuid>.jsonl
         Source::Codex => {
             let stem = path
@@ -338,6 +554,9 @@ pub(crate) struct Event {
 pub(crate) fn parse(path: &Path) -> Result<Vec<Event>> {
     if let Some(id) = path.to_str().and_then(|s| s.strip_prefix("opencode:")) {
         return parse_opencode(id);
+    }
+    if let Some(id) = path.to_str().and_then(|s| s.strip_prefix("cursor:")) {
+        return parse_cursor(id);
     }
     let s = std::fs::read_to_string(path)?;
     Ok(s.lines()
@@ -527,19 +746,38 @@ fn custom_tool_call_item(call_id: String, name: &str, input: &str) -> Item {
     }
 }
 
-fn tool_targets(name: &str, args: &Value) -> Vec<(Action, String)> {
+/// Tool names and argument keys across harnesses; Cursor uses read_file(_v2),
+/// search_replace / edit_file(_v2) / write / delete_file, run_terminal_cmd
+/// (run_terminal_command_v2), and apply_patch.
+pub(crate) fn tool_targets(name: &str, args: &Value) -> Vec<(Action, String)> {
     let file = || {
-        ["path", "file_path", "filePath", "notebook_path"]
-            .iter()
-            .find_map(|k| args[*k].as_str())
-            .map(String::from)
+        [
+            "path",
+            "file_path",
+            "filePath",
+            "notebook_path",
+            "target_file",
+            "targetFile",
+            "relativeWorkspacePath",
+        ]
+        .iter()
+        .find_map(|k| args[*k].as_str())
+        .map(String::from)
     };
     match name.to_ascii_lowercase().as_str() {
-        "read" => file().map(|p| (Action::Read, p)).into_iter().collect(),
-        "write" | "edit" | "multiedit" | "notebookedit" => {
+        "read" | "read_file" | "read_file_v2" => {
+            file().map(|p| (Action::Read, p)).into_iter().collect()
+        }
+        "write" | "edit" | "multiedit" | "notebookedit" | "search_replace" | "edit_file"
+        | "edit_file_v2" | "delete_file" => {
             file().map(|p| (Action::Mutate, p)).into_iter().collect()
         }
-        "bash" | "exec_command" | "shell" | "local_shell" => {
+        "bash"
+        | "exec_command"
+        | "shell"
+        | "local_shell"
+        | "run_terminal_cmd"
+        | "run_terminal_command_v2" => {
             let cmd = args["command"]
                 .as_str()
                 .map(String::from)
@@ -1316,6 +1554,77 @@ mod tests {
             Item::Thinking(_)
         ));
         assert!(opencode_items(&json!({"type":"step-start"})).is_empty());
+    }
+
+    #[test]
+    fn cursor_bubble_yields_call_and_result() {
+        let bubble = json!({"type":2,"bubbleId":"b1","toolFormerData":{"name":"read_file","toolCallId":"c1",
+            "rawArgs":"{\"target_file\": \"/a.rs\"}","params":"{\"targetFile\":\"/a.rs\",\"charsLimit\":100000}",
+            "result":"{\"contents\":\"file contents here\",\"totalLinesInFile\":1}"}});
+        let items = cursor_items(&bubble);
+        assert_eq!(items.len(), 2);
+        let Item::ToolCall { targets, .. } = &items[0] else {
+            panic!("expected call")
+        };
+        assert_eq!(targets, &vec![(Action::Read, "/a.rs".to_string())]);
+        let Item::ToolResult { call_id, tokens } = &items[1] else {
+            panic!("expected result")
+        };
+        assert_eq!(call_id, "c1");
+        assert_eq!(*tokens, estimate_tokens("file contents here")); // priced from the payload, not the JSON wrapper
+
+        // the v2 shell tool sends no rawArgs; Cursor's params carry the command
+        let shell = json!({"toolFormerData":{"name":"run_terminal_command_v2","toolCallId":"c2","rawArgs":"",
+            "params":"{\"command\":\"cat notes.md\",\"cwd\":\"/w\"}","result":"{\"output\":\"hello\"}"}});
+        let Item::ToolCall { targets, .. } = &cursor_items(&shell)[0] else {
+            panic!("expected call")
+        };
+        assert_eq!(targets, &vec![(Action::Read, "notes.md".to_string())]);
+
+        // apply_patch carries the raw patch text instead of JSON
+        let patch = json!({"toolFormerData":{"name":"apply_patch","toolCallId":"c3",
+            "rawArgs":"*** Begin Patch\n*** Update File: src/x.rs\n*** End Patch",
+            "params":"{\"relativeWorkspacePath\":\"src/x.rs\"}","result":"{\"resultForModel\":\"Success.\"}"}});
+        let Item::ToolCall { targets, .. } = &cursor_items(&patch)[0] else {
+            panic!("expected call")
+        };
+        assert_eq!(targets, &vec![(Action::Mutate, "src/x.rs".to_string())]);
+
+        assert!(matches!(
+            cursor_items(&json!({"type":2,"thinking":{"text":"hmm"}}))[0],
+            Item::Thinking(_)
+        ));
+        // a failed call with no tool name is not a turn
+        assert!(
+            cursor_items(
+                &json!({"type":2,"text":"","toolFormerData":{"additionalData":{"status":"error"}}})
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn cursor_tool_names_map_to_actions() {
+        assert_eq!(
+            tool_targets("search_replace", &json!({"file_path":"/a"})),
+            vec![(Action::Mutate, "/a".into())]
+        );
+        assert_eq!(
+            tool_targets("edit_file_v2", &json!({"relativeWorkspacePath":"/b"})),
+            vec![(Action::Mutate, "/b".into())]
+        );
+        assert_eq!(
+            tool_targets("delete_file", &json!({"target_file":"/c"})),
+            vec![(Action::Mutate, "/c".into())]
+        );
+        assert_eq!(
+            tool_targets("run_terminal_cmd", &json!({"command":"sed -i 's/a/b/' d"})),
+            vec![(Action::Mutate, "d".into())]
+        );
+        assert_eq!(
+            tool_targets("read_file_v2", &json!({"path":"/e"})),
+            vec![(Action::Read, "/e".into())]
+        );
     }
 
     #[test]
