@@ -6,7 +6,7 @@ Usage:
     HOME=/tmp/cxwatch-demo-home cxwatch audit  # or: vhs demo.tape
 
 The data is entirely synthetic ("acmeshop" project) but shaped exactly like
-real Claude Code / Codex / pi / OpenCode transcripts, and it triggers every
+real Claude Code / Codex / pi / OpenCode / Cursor transcripts, and it triggers every
 session and config rule at least once.
 """
 
@@ -182,6 +182,53 @@ for i, title in enumerate(["Refactor checkout flow", "Payment gateway audit"]):
 db.commit()
 db.close()
 
+# ---------- cursor db ----------
+# Cursor keeps chats in the app's global state store: one composerData row per
+# conversation and one bubbleId row per turn (a tool call and its result share a bubble).
+
+cursor_dir = os.path.join(
+    HOME,
+    "Library/Application Support/Cursor/User/globalStorage"
+    if sys.platform == "darwin"
+    else ".config/Cursor/User/globalStorage",
+)
+os.makedirs(cursor_dir, exist_ok=True)
+cdb = sqlite3.connect(os.path.join(cursor_dir, "state.vscdb"))
+cdb.execute("CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
+CID = "aaaaaaaa-0000-4000-8000-000000000001"
+CART = "/Users/demo/dev/acmeshop/src/cart.ts"
+
+
+def bubble(bid, kind, **fields):
+    b = {"_v": 3, "type": kind, "bubbleId": bid, "text": "", "createdAt": "2026-08-20T11:00:00.000Z"}
+    b.update(fields)
+    return b
+
+
+def tool_bubble(bid, name, raw_args, result):
+    return bubble(bid, 2, toolFormerData={
+        "name": name, "toolCallId": f"tool_{bid}", "status": "completed",
+        "rawArgs": json.dumps(raw_args), "params": "{}", "result": json.dumps(result)})
+
+
+cursor_bubbles = [
+    bubble("b1", 1, text="the cart total is off by a cent on discounted items, fix it"),
+    tool_bubble("b2", "read_file", {"target_file": CART}, {"contents": BIG_CODE}),
+    tool_bubble("b3", "read_file", {"target_file": CART}, {"contents": BIG_CODE}),
+    tool_bubble("b4", "search_replace", {"file_path": CART, "old_string": "round(total)", "new_string": "round(line)"},
+                {"resultForModel": "Success. Updated the following files:\nM src/cart.ts"}),
+    bubble("b5", 2, text="Rounded per line item instead of on the sum; totals now match the gateway."),
+]
+ms = int((NOW - 420) * 1000)
+cdb.execute("INSERT INTO cursorDiskKV VALUES (?,?)", (f"composerData:{CID}", json.dumps({
+    "composerId": CID, "name": "Fix cart rounding on discounts", "unifiedMode": "agent",
+    "createdAt": ms - 60000, "lastUpdatedAt": ms,
+    "fullConversationHeadersOnly": [{"bubbleId": b["bubbleId"], "type": b["type"]} for b in cursor_bubbles]})))
+for b in cursor_bubbles:
+    cdb.execute("INSERT INTO cursorDiskKV VALUES (?,?)", (f"bubbleId:{CID}:{b['bubbleId']}", json.dumps(b)))
+cdb.commit()
+cdb.close()
+
 # ---------- config ----------
 
 write(".claude/skills/legacy-importer/SKILL.md",
@@ -189,6 +236,9 @@ write(".claude/skills/legacy-importer/SKILL.md",
       + "Steps to import the legacy catalog dumps. " * 60, OLD)
 write(".claude/skills/deploy-helper/SKILL.md",
       "---\nname: deploy-helper\ndescription: Ship a release to staging and production.\n---\n\nRun the deploy pipeline.\n", OLD)
+write(".cursor/skills/vue-conventions/SKILL.md",
+      "---\nname: vue-conventions\ndescription: House style for Vue components.\n---\n\n"
+      + "Use script setup, typed props, and scoped styles. " * 40, OLD)
 write(".claude/commands/ship.md", "Tag, changelog, deploy to prod, announce in the channel.\n", OLD)
 write(".claude/CLAUDE.md",
       "# Releases\nWhen I say ship it, invoke the deploy-helper skill.\n\n"

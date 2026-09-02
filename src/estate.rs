@@ -37,6 +37,7 @@ pub(crate) struct EstateSummary {
     pub sessions_claude: usize,
     pub sessions_codex: usize,
     pub sessions_pi: usize,
+    pub sessions_cursor: usize,
     pub units: usize,
     pub findings: usize,
     pub tokens_flagged: usize,
@@ -89,6 +90,7 @@ enum Harness {
     Claude,
     Codex,
     Pi,
+    Cursor,
 }
 
 impl Harness {
@@ -97,6 +99,7 @@ impl Harness {
             Harness::Claude => 0,
             Harness::Codex => 1,
             Harness::Pi => 2,
+            Harness::Cursor => 3,
         }
     }
 }
@@ -121,6 +124,7 @@ struct Usage {
     claude_sessions: usize,
     codex_sessions: usize,
     pi_sessions: usize,
+    cursor_sessions: usize,
     skills: HashMap<String, usize>, // Skill tool invocations (claude)
     commands: HashMap<String, usize>, // slash commands (claude)
     mcp_claude: HashMap<String, usize>, // mcp__server__ calls per harness
@@ -129,9 +133,10 @@ struct Usage {
     skill_reads_claude: HashMap<String, usize>,
     skill_reads_codex: HashMap<String, usize>,
     skill_reads_pi: HashMap<String, usize>,
+    skill_reads_cursor: HashMap<String, usize>,
     bash: HashMap<String, CmdStat>, // per command head, claude only
     directives: HashMap<String, DirectiveStat>, // normalized short user messages, claude only
-    session_toks: [Vec<usize>; 3],  // rough tokens per session, indexed by Harness::idx
+    session_toks: [Vec<usize>; 4],  // rough tokens per session, indexed by Harness::idx
 }
 
 fn scan_usage(home: &Path) -> Usage {
@@ -151,6 +156,9 @@ fn scan_usage(home: &Path) -> Usage {
             };
             count_transcript(&s, harness, &mut u);
         }
+    }
+    for bubbles in crate::cursor_bubbles() {
+        count_cursor_session(&bubbles, &mut u);
     }
     u
 }
@@ -187,7 +195,46 @@ fn count_transcript(hay: &str, harness: Harness, usage: &mut Usage) {
             usage.pi_sessions += 1;
             count_skill_reads(hay, &mut usage.skill_reads_pi);
         }
+        // cursor sessions arrive as parsed bubbles, see count_cursor_session
+        Harness::Cursor => usage.cursor_sessions += 1,
     }
+}
+
+/// Cursor keeps tool arguments and results as JSON-encoded strings inside
+/// each turn's bubble, so usage is read from parsed bubbles rather than raw
+/// substrings. Size is content chars / 4: nothing is duplicated here, unlike
+/// the JSONL transcripts; within ~10% of the o200k count on real chats.
+fn count_cursor_session(bubbles: &[Value], usage: &mut Usage) {
+    usage.cursor_sessions += 1;
+    let mut chars = 0usize;
+    for bubble in bubbles {
+        chars += bubble["text"].as_str().map_or(0, str::len)
+            + bubble["thinking"]["text"].as_str().map_or(0, str::len);
+        let tool = &bubble["toolFormerData"];
+        let Some(name) = tool["name"].as_str() else {
+            continue;
+        };
+        chars += crate::cursor_result_text(tool).len();
+        for (action, path) in crate::tool_targets(name, &crate::cursor_args(tool)) {
+            if action == crate::Action::Read
+                && let Some(skill) = skill_from_path(&path)
+            {
+                *usage.skill_reads_cursor.entry(skill).or_default() += 1;
+            }
+        }
+    }
+    usage.session_toks[Harness::Cursor.idx()].push(chars / 4);
+}
+
+/// `<anything>/skills/<name>/SKILL.md` -> `<name>`.
+fn skill_from_path(path: &str) -> Option<String> {
+    let (dir, name) = path.strip_suffix("/SKILL.md")?.rsplit_once('/')?;
+    let valid = !name.is_empty()
+        && name.len() < 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    (valid && dir.rsplit('/').next() == Some("skills")).then(|| name.to_string())
 }
 
 fn count_captures(
@@ -551,6 +598,18 @@ pub(crate) fn audit() -> EstateReport {
             "pi",
             usage.pi_sessions,
             &usage.skill_reads_pi,
+            &mut seen,
+            &mut units,
+            &mut findings,
+            now,
+        );
+    }
+    for f in cursor_skill_files(&home.join(".cursor/skills")) {
+        push_harness_skill(
+            &f,
+            "cursor",
+            usage.cursor_sessions,
+            &usage.skill_reads_cursor,
             &mut seen,
             &mut units,
             &mut findings,
@@ -964,9 +1023,10 @@ pub(crate) fn audit() -> EstateReport {
     // interaction: session size distribution per harness
     let mut session_stats = Vec::new();
     for (i, (label, sessions_root)) in [
-        ("claude", ".claude/projects"),
-        ("codex", ".codex/sessions"),
-        ("pi", ".pi/agent/sessions"),
+        ("claude", home.join(".claude/projects")),
+        ("codex", home.join(".codex/sessions")),
+        ("pi", home.join(".pi/agent/sessions")),
+        ("cursor", crate::cursor_db()),
     ]
     .into_iter()
     .enumerate()
@@ -988,7 +1048,7 @@ pub(crate) fn audit() -> EstateReport {
             findings.push(EstateFinding {
                 rule: "long-sessions",
                 unit: format!("{label} sessions"),
-                path: home.join(sessions_root).display().to_string(),
+                path: sessions_root.display().to_string(),
                 fix: "start a fresh session per task and hand context over explicitly (a plan file or summary) instead of carrying the whole history".into(),
                 tokens: 0,
                 uses: over,
@@ -1023,6 +1083,7 @@ pub(crate) fn audit() -> EstateReport {
     push_usage("skill-read(claude)", &usage.skill_reads_claude);
     push_usage("skill-read(codex)", &usage.skill_reads_codex);
     push_usage("skill-read(pi)", &usage.skill_reads_pi);
+    push_usage("skill-read(cursor)", &usage.skill_reads_cursor);
     push_usage("command", &usage.commands);
     push_usage("mcp(claude)", &usage.mcp_claude);
     push_usage("mcp(codex)", &usage.mcp_codex);
@@ -1054,6 +1115,7 @@ pub(crate) fn audit() -> EstateReport {
             sessions_claude: usage.claude_sessions,
             sessions_codex: usage.codex_sessions,
             sessions_pi: usage.pi_sessions,
+            sessions_cursor: usage.cursor_sessions,
             units,
             findings: findings.len(),
             tokens_flagged,
@@ -1101,12 +1163,15 @@ fn push_harness_skill(
     *units += 1;
     if reads.get(&name).copied().unwrap_or(0) == 0 && age_days(now, md.modified().ok()) > GRACE_DAYS
     {
-        let fix = if harness == "codex" {
-            format!(
+        let fix = match harness {
+            "codex" => format!(
                 "disable or uninstall the Codex plugin providing `{name}` (deleting from the plugin cache gets re-synced)"
-            )
-        } else {
-            format!("remove the pi package providing `{name}` from ~/.pi/agent/npm")
+            ),
+            "cursor" => format!(
+                "confirm with the user, then `rm -r {}`",
+                skill_md.parent().unwrap_or(skill_md).display()
+            ),
+            _ => format!("remove the pi package providing `{name}` from ~/.pi/agent/npm"),
         };
         findings.push(EstateFinding {
             rule: "dead-skill",
@@ -1135,6 +1200,33 @@ fn find_skill_mds(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             }
         }
     }
+}
+
+/// Cursor user skills: ~/.cursor/skills/<name>/SKILL.md. A skill marked
+/// `disable-model-invocation: true` loads only when the user types `/name`,
+/// so it costs nothing per session and is not audited.
+fn cursor_skill_files(skills: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(skills) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path().join("SKILL.md"))
+        .filter(|f| f.is_file())
+        .filter(|f| !model_invocation_disabled(&std::fs::read_to_string(f).unwrap_or_default()))
+        .collect()
+}
+
+fn model_invocation_disabled(skill_md: &str) -> bool {
+    let Some((front, _)) = skill_md
+        .strip_prefix("---")
+        .and_then(|rest| rest.split_once("\n---"))
+    else {
+        return false;
+    };
+    front.lines().any(|l| {
+        l.split_once(':')
+            .is_some_and(|(k, v)| k.trim() == "disable-model-invocation" && v.trim() == "true")
+    })
 }
 
 /// pi skills live at node_modules/<pkg>/skills/<name>/SKILL.md (pkg may be scoped).
@@ -1377,6 +1469,7 @@ fn harness_counts(s: &EstateSummary) -> String {
         (s.sessions_claude, "claude"),
         (s.sessions_codex, "codex"),
         (s.sessions_pi, "pi"),
+        (s.sessions_cursor, "cursor"),
     ]
     .iter()
     .filter(|(n, _)| *n > 0)
@@ -1587,13 +1680,19 @@ fn backticked(s: &str) -> Option<String> {
 /// Derive the mechanical fix for a finding. Manual means: hand it to a human/agent.
 pub(crate) fn fix_op(f: &EstateFinding) -> FixOp {
     match f.rule {
-        // claude skills live in their own dir; codex/pi skills are plugin/package-managed
-        "dead-skill" if !f.unit.contains(':') => FixOp::Trash {
-            path: Path::new(&f.path)
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| f.path.clone()),
-        },
+        // claude and cursor skills live in their own user-owned dir; codex/pi skills are plugin/package-managed
+        "dead-skill"
+            if ["/.claude/skills/", "/.cursor/skills/"]
+                .iter()
+                .any(|dir| f.path.contains(dir)) =>
+        {
+            FixOp::Trash {
+                path: Path::new(&f.path)
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| f.path.clone()),
+            }
+        }
         "dead-command" => FixOp::Trash {
             path: f.path.clone(),
         },
@@ -1979,6 +2078,18 @@ mod tests {
         let f = finding("dead-skill", "skill codex:linear", "/x/SKILL.md", "");
         assert_eq!(fix_op(&f), FixOp::Manual);
         let f = finding(
+            "dead-skill",
+            "skill cursor:vue",
+            "/h/.cursor/skills/vue/SKILL.md",
+            "",
+        );
+        assert_eq!(
+            fix_op(&f),
+            FixOp::Trash {
+                path: "/h/.cursor/skills/vue".into()
+            }
+        );
+        let f = finding(
             "orphan-memory",
             "memory p/a.md",
             "/m/memory/a.md",
@@ -2153,6 +2264,7 @@ mod tests {
             sessions_claude: 42,
             sessions_codex: 0,
             sessions_pi: 0,
+            sessions_cursor: 0,
             units: 0,
             findings: 0,
             tokens_flagged: 0,
@@ -2160,9 +2272,60 @@ mod tests {
         assert_eq!(harness_counts(&s), "42 claude sessions");
         s.sessions_pi = 7;
         assert_eq!(harness_counts(&s), "42 claude · 7 pi sessions");
+        s.sessions_cursor = 3;
+        assert_eq!(harness_counts(&s), "42 claude · 7 pi · 3 cursor sessions");
         s.sessions_claude = 0;
         s.sessions_pi = 0;
+        s.sessions_cursor = 0;
         assert_eq!(harness_counts(&s), "no local sessions");
+    }
+
+    #[test]
+    fn cursor_bubbles_count_skill_reads_and_size() {
+        let read = serde_json::json!({"type":2,"text":"","toolFormerData":{"name":"read_file","toolCallId":"c1",
+            "rawArgs":"{\"target_file\": \"/Users/x/.cursor/skills/vue-conventions/SKILL.md\"}",
+            "result":"{\"contents\":\"abcdefgh\"}"}});
+        let prose_text = "see ~/.cursor/skills/other/SKILL.md for details";
+        let prose = serde_json::json!({"type":2,"text":prose_text});
+        let mut usage = Usage::default();
+        count_cursor_session(&[read, prose], &mut usage);
+        assert_eq!(usage.cursor_sessions, 1);
+        assert_eq!(usage.skill_reads_cursor.get("vue-conventions"), Some(&1));
+        assert!(!usage.skill_reads_cursor.contains_key("other")); // a mention is not a read
+        assert_eq!(
+            usage.session_toks[Harness::Cursor.idx()],
+            vec![(8 + prose_text.len()) / 4]
+        );
+    }
+
+    #[test]
+    fn skill_name_from_read_path() {
+        assert_eq!(
+            skill_from_path("/Users/x/.cursor/skills/foo-bar/SKILL.md"),
+            Some("foo-bar".into())
+        );
+        assert_eq!(
+            skill_from_path("/Users/x/.cursor/skills/foo/notes/SKILL.md"),
+            None
+        );
+        assert_eq!(skill_from_path("/Users/x/foo/SKILL.md"), None);
+        assert_eq!(
+            skill_from_path("/Users/x/.cursor/skills/foo/README.md"),
+            None
+        );
+    }
+
+    #[test]
+    fn slash_only_cursor_skills_are_skipped() {
+        assert!(model_invocation_disabled(
+            "---\nname: review\ndisable-model-invocation: true\n---\n# Review\n"
+        ));
+        assert!(!model_invocation_disabled(
+            "---\nname: review\ndescription: x\n---\nbody"
+        ));
+        assert!(!model_invocation_disabled(
+            "no frontmatter, disable-model-invocation: true in prose"
+        ));
     }
 
     #[test]

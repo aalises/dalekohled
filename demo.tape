@@ -21,7 +21,7 @@ Show
 
 # ── intro card ──
 Hide
-Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — \033[1msee the context your coding agent no longer needs\033[0m\n\n   agents hoard stale file reads, superseded output and dead configuration.\n   cxwatch finds it, prices it in tokens, and fixes it.\n\n   works with \033[1mClaude Code · Codex · pi · OpenCode\033[0m\n\n   \033[2mall data in this demo is synthetic (demo/fixtures.py)\033[0m\n'`
+Type `clear && printf '\n\n\n\n   \033[1;36m🔭  cxwatch\033[0m — \033[1msee the context your coding agent no longer needs\033[0m\n\n   agents hoard stale file reads, superseded output and dead configuration.\n   cxwatch finds it, prices it in tokens, and fixes it.\n\n   works with \033[1mClaude Code · Codex · pi · OpenCode · Cursor\033[0m\n\n   \033[2mall data in this demo is synthetic (demo/fixtures.py)\033[0m\n'`
 Enter
 Show
 Sleep 4s

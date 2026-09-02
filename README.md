@@ -4,7 +4,7 @@
 
 cxwatch audits coding-agent sessions and persistent agent setup. It ranks stale context by token cost, shows the evidence for each finding, and gives you a clear cleanup path.
 
-**Supported harnesses: Claude Code, Codex, pi, and OpenCode.**
+**Supported harnesses: Claude Code, Codex, pi, OpenCode, and Cursor.**
 
 ![cxwatch terminal demo](demo.gif)
 
@@ -34,8 +34,11 @@ The default audits use local files. They do not change your agent configuration.
 | Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` | Plugin skills, MCP servers, and `AGENTS.md` |
 | pi | `~/.pi/agent/sessions` | Package skills |
 | OpenCode | `~/.local/share/opencode/opencode.db` | `~/.config/opencode/AGENTS.md` |
+| Cursor | Agent and chat conversations in the app's `state.vscdb` | User skills in `~/.cursor/skills` |
 
-cxwatch reads OpenCode session data through the local `sqlite3` command in read-only mode.
+cxwatch reads OpenCode and Cursor session data through the local `sqlite3` command in read-only mode.
+
+Cursor keeps its conversations in `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` on macOS, `~/.config/Cursor/User/globalStorage/state.vscdb` on Linux, and `%APPDATA%\Cursor\User\globalStorage\state.vscdb` on Windows. cxwatch reads that store directly. The text-only hook transcripts under `~/.cursor/projects` are mirrors of the same conversations without tool calls, so cxwatch does not read them.
 
 ## Install and start
 
@@ -48,7 +51,7 @@ cxwatch audit
 
 The first command installs cxwatch. The second command audits your agent config.
 
-If you use OpenCode, the `sqlite3` command must be available in your `PATH`.
+If you use OpenCode or Cursor, the `sqlite3` command must be available in your `PATH`.
 
 To install from a local clone:
 
@@ -78,7 +81,7 @@ The first command lists every discovered session. The second audits one of them.
 | `cxwatch audit -o report.md` | Writes a Markdown report instead of printing (works with and without a session) |
 | `cxwatch audit --fix` | Offers each supported mechanical config fix for confirmation |
 
-A `SESSION` can be a transcript path. OpenCode sessions use the internal `opencode:<id>` form that `cxwatch sessions` prints.
+A `SESSION` can be a transcript path. OpenCode sessions use the internal `opencode:<id>` form and Cursor sessions the `cursor:<id>` form; `cxwatch sessions` prints both.
 
 ## Session audit
 
@@ -139,7 +142,7 @@ cxwatch can apply a limited set of mechanical config fixes:
 - add a missing memory index entry;
 - remove a broken memory index entry;
 - append a repeated instruction to `~/.claude/CLAUDE.md`;
-- move an unused Claude Code skill or command to the cxwatch trash;
+- move an unused Claude Code or Cursor skill, or an unused Claude Code command, to the cxwatch trash;
 - remove an unused Claude Code MCP server with `claude mcp remove`;
 - remove an unused Codex MCP table from `config.toml`.
 
@@ -202,6 +205,7 @@ The config plan groups findings by action and gives each item a concrete checkli
 - The report depends on the transcript formats that each agent writes.
 - Shell analysis recognizes common file readers such as `cat`, `head`, `tail`, and `sed`.
 - A config use count includes only the transcripts that are available on the computer.
+- Cursor skill use is observed as reads of `SKILL.md`. Skills marked `disable-model-invocation: true` load only on request, so cxwatch does not audit them. Cursor's MCP servers, rules, hooks, and commands are not audited yet.
 - The semantic pass can find nuanced problems, but its output still needs review.
 - cxwatch audits context. It does not compact or rewrite an active session.
 
