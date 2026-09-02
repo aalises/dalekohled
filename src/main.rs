@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub(crate) const REPORT_VERSION: u8 = 3;
+pub(crate) const REPORT_VERSION: u8 = 4;
 const THINKING_THRESHOLD: usize = 2_000;
 const OUTPUT_THRESHOLD: usize = 2_500;
 pub(crate) const DEFAULT_SEMANTIC_MODEL: &str = "moonshotai/kimi-k3";
