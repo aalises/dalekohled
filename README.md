@@ -30,8 +30,8 @@ The default audits use local files. They do not change your agent configuration.
 
 | Harness | Session data | Config data |
 |---|---|---|
-| Claude Code | `~/.claude/projects` | Skills, commands, MCP servers, hooks, memory, and `CLAUDE.md` |
-| Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` | Plugin skills, MCP servers, and `AGENTS.md` |
+| Claude Code | `~/.claude/projects` | Skills (user and installed plugins), commands, MCP servers, hooks, memory, and `CLAUDE.md` |
+| Codex | `~/.codex/sessions` and `~/.codex/archived_sessions` | Plugin skills, user skills in `~/.codex/skills` and `~/.agents/skills`, MCP servers, and `AGENTS.md` |
 | pi | `~/.pi/agent/sessions` | Package skills |
 | OpenCode | `~/.local/share/opencode/opencode.db` | `~/.config/opencode/AGENTS.md` |
 | Cursor | Agent and chat conversations in the app's `state.vscdb` | User skills in `~/.cursor/skills` |
@@ -109,7 +109,8 @@ A config audit checks persistent context against observed use in local transcrip
 | Check | What it means |
 |---|---|
 | `dead-mcp` | An MCP server has no observed calls in its configured agent |
-| `dead-skill` | A skill has no observed use after a 14-day grace period |
+| `dead-skill` | A skill has no observed use after a 14-day grace period; a single use clears it |
+| `duplicate-skill` | One skill is mounted from two places in the same harness, or two skills in a harness have near-identical descriptions |
 | `dead-command` | A Claude Code command has no observed use |
 | `repeated-directive` | You typed the same instruction in three or more sessions; it belongs in `CLAUDE.md` |
 | `blocked-command` | A shell command was permission-denied three or more times |
@@ -123,7 +124,9 @@ A config audit checks persistent context against observed use in local transcrip
 | `stale-memory` | A memory file has not changed for 120 days |
 | `heavy-block` | An always-loaded instruction section contains more than 400 tokens |
 
-A harness with no local sessions gives no evidence, so cxwatch omits it from the report entirely: no findings, no zero counts. The report also shows a per-harness session size distribution (median, p90, and the count of long sessions) from rough per-transcript token estimates.
+A harness with no local sessions gives no evidence, so cxwatch omits it from the report entirely: no findings, no zero counts. Dead means zero observed uses: a unit used even once is never listed, so a skill you only need now and then is safe. The report also shows a per-harness session size distribution (median, p90, and the count of long sessions) from rough per-transcript token estimates.
+
+To keep long reports readable, each check shows its ten costliest findings in full. The terminal output summarizes the rest in one line, the Markdown plan opens with a summary table and lists the rest in brief, and the JSON output is always complete.
 
 Each finding includes:
 
@@ -164,7 +167,7 @@ Before cxwatch edits a file, it saves a copy under `~/.cache/cxwatch/trash`. cxw
 
 Deterministic audits stay on your computer. They parse transcripts, count tokens, match file operations, and compare configured units with observed calls.
 
-The optional semantic pass looks for contradictions and repeated guidance that fixed rules cannot detect. For the config audit this includes instructions you keep typing in different words across sessions, with a proposed `CLAUDE.md` line for each:
+The optional semantic pass looks for contradictions and repeated guidance that fixed rules cannot detect. For the config audit this includes instructions you keep typing in different words across sessions, with a proposed `CLAUDE.md` line for each, and skills in one harness whose descriptions cover the same job:
 
 ```bash
 cxwatch audit path/to/run.jsonl --semantic
@@ -205,7 +208,8 @@ The config plan groups findings by action and gives each item a concrete checkli
 - The report depends on the transcript formats that each agent writes.
 - Shell analysis recognizes common file readers such as `cat`, `head`, `tail`, and `sed`.
 - A config use count includes only the transcripts that are available on the computer.
-- Cursor skill use is observed as reads of `SKILL.md`. Skills marked `disable-model-invocation: true` load only on request, so cxwatch does not audit them. Cursor's MCP servers, rules, hooks, and commands are not audited yet.
+- Codex, pi, and Cursor skill use is observed as reads of `SKILL.md`, matched by skill name, so two copies of one skill share a use count. Codex plugin skills count only for plugins that `~/.codex/config.toml` lists as enabled; Claude plugin skills come from the versions that `installed_plugins.json` marks as installed.
+- Cursor skills marked `disable-model-invocation: true` load only on request, so cxwatch does not audit them. Cursor's MCP servers, rules, hooks, and commands are not audited yet.
 - The semantic pass can find nuanced problems, but its output still needs review.
 - cxwatch audits context. It does not compact or rewrite an active session.
 

@@ -16,6 +16,12 @@ const CMD_DENY_MIN: usize = 3;
 const CMD_FAIL_MIN: usize = 3;
 const DIRECTIVE_MIN_SESSIONS: usize = 3;
 const DENIAL_MARKER: &str = "doesn't want to proceed";
+/// Findings shown in full per rule; the rest are summarized (terminal) or listed in brief (markdown).
+const MAX_PER_RULE: usize = 10;
+/// Two skill descriptions count as near-identical at this word-set Jaccard overlap ...
+const DESC_OVERLAP_MIN: f32 = 0.6;
+/// ... provided they share at least this many content words.
+const DESC_SHARED_MIN: usize = 6;
 
 #[derive(Serialize, Clone)]
 pub(crate) struct EstateFinding {
@@ -59,6 +65,20 @@ pub(crate) struct SessionStat {
     pub over_long: usize,
 }
 
+/// One mounted skill, as the harness sees it.
+#[derive(Serialize, Clone, Debug)]
+pub(crate) struct SkillInfo {
+    pub harness: &'static str,
+    pub name: String,
+    /// Where the harness mounts it from: a user dir (`~/.codex/skills`), a plugin
+    /// (`plugin visualize@openai-bundled`), or a pi package.
+    pub source: String,
+    pub path: String,
+    pub tokens: usize,
+    pub uses: usize,
+    pub description: String,
+}
+
 #[derive(Serialize, Clone)]
 pub(crate) struct EstateReport {
     pub version: u8,
@@ -67,6 +87,8 @@ pub(crate) struct EstateReport {
     pub blocks: Vec<Block>,
     /// Rough per-harness session size distribution; only harnesses with sessions.
     pub session_stats: Vec<SessionStat>,
+    /// Every skill the audited harnesses mount, with observed use.
+    pub skills: Vec<SkillInfo>,
     /// Positive usage counts, for JSON consumers and the semantic digest.
     pub usage: Vec<String>,
     /// Short user messages observed across sessions ("N× text"), for JSON
@@ -528,94 +550,116 @@ pub(crate) fn audit() -> EstateReport {
     let now = SystemTime::now();
     let mut findings = Vec::new();
     let mut units = 0usize;
+    let codex_config = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap_or_default();
 
-    // Claude skills: ~/.claude/skills/*/SKILL.md
-    let mut skill_names = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(home.join(".claude/skills")) {
-        for e in rd.flatten() {
-            let f = e.path().join("SKILL.md");
-            let Ok(md) = f.metadata() else { continue };
-            let name = e.file_name().to_string_lossy().to_string();
-            units += 1;
-            // claude skills are invoked via the Skill tool or a slash command;
-            // file reads are not the harness mechanism here (unlike codex/pi)
-            let uses = usage.skills.get(&name).copied().unwrap_or(0)
-                + usage.commands.get(&name).copied().unwrap_or(0);
-            if usage.claude_sessions > 0
-                && uses == 0
-                && age_days(now, md.modified().ok()) > GRACE_DAYS
-            {
-                let reads = usage.skill_reads_claude.get(&name).copied().unwrap_or(0);
-                let reads_note = if reads > 0 {
-                    format!(" ({reads} raw file reads observed, hooks or manual)")
-                } else {
-                    String::new()
-                };
-                findings.push(EstateFinding {
-                    rule: "dead-skill",
-                    unit: format!("skill {name}"),
-                    path: f.display().to_string(),
-                    fix: format!(
-                        "confirm with the user, then `rm -r {}`; if the guidance is still wanted, move the key lines into a doc that is read on demand instead of an always-listed skill",
-                        f.parent().unwrap_or(&f).display()
-                    ),
-                    tokens: crate::estimate_tokens(&std::fs::read_to_string(&f).unwrap_or_default()),
-                    uses: 0,
-                    detail: format!(
-                        "never invoked across {} claude sessions; its description is loaded every session{reads_note}{}",
-                        usage.claude_sessions,
-                        git_note(&f)
-                    ),
-                    action: "delete or demote",
-                });
-            }
-            skill_names.push(name);
-        }
-    }
-
-    // Codex plugin skills and pi package skills, judged by SKILL.md reads in their own transcripts
+    // skills: every SKILL.md a harness mounts, judged by that harness's own transcripts
+    let mut skills: Vec<SkillInfo> = Vec::new();
     let mut seen = HashSet::new();
-    let mut plugin_skills = Vec::new();
-    find_skill_mds(&home.join(".codex/plugins"), &mut plugin_skills, 8);
-    for f in plugin_skills {
-        if f.to_string_lossy().contains("staging") {
-            continue;
-        }
-        push_harness_skill(
+    let claude_uses = |name: &str| {
+        usage.skills.get(name).copied().unwrap_or(0)
+            + usage.commands.get(name).copied().unwrap_or(0)
+    };
+    // Claude user skills are invoked via the Skill tool or a slash command; file reads
+    // are not the harness mechanism here (unlike codex/pi/cursor)
+    let mut skill_names = Vec::new();
+    for f in user_skill_files(&home.join(".claude/skills")) {
+        let name = skill_dir_name(&f);
+        push_skill(
             &f,
+            "claude",
+            usage.claude_sessions,
+            claude_uses(&name),
+            usage.skill_reads_claude.get(&name).copied().unwrap_or(0),
+            &home,
+            &mut seen,
+            &mut units,
+            &mut findings,
+            &mut skills,
+            now,
+        );
+        skill_names.push(name);
+    }
+    // Claude plugin skills: the installed version of each plugin, invoked as `plugin:skill`
+    for (plugin, f) in claude_plugin_skill_files(&home) {
+        let name = skill_dir_name(&f);
+        let uses = claude_uses(&format!("{plugin}:{name}")) + claude_uses(&name);
+        push_skill(
+            &f,
+            "claude",
+            usage.claude_sessions,
+            uses,
+            0,
+            &home,
+            &mut seen,
+            &mut units,
+            &mut findings,
+            &mut skills,
+            now,
+        );
+    }
+    // Codex (plugin cache plus both user skill dirs), pi packages, and Cursor user
+    // skills all load a skill by reading its SKILL.md, so reads are the use signal
+    let mut codex_files = Vec::new();
+    find_skill_mds(&home.join(".codex/plugins"), &mut codex_files, 8);
+    let enabled_plugins = codex_enabled_plugins(&codex_config);
+    codex_files.retain(|f| {
+        if f.to_string_lossy().contains("staging") {
+            return false;
+        }
+        // cached but not enabled in config.toml = not mounted
+        match (&enabled_plugins, skill_source(f, &home)) {
+            (Some(list), source) => source
+                .strip_prefix("plugin ")
+                .is_none_or(|plugin| list.contains(plugin)),
+            (None, _) => true,
+        }
+    });
+    codex_files.extend(user_skill_files(&home.join(".codex/skills")));
+    codex_files.extend(user_skill_files(&home.join(".agents/skills")));
+    for (harness, sessions, reads, files) in [
+        (
             "codex",
             usage.codex_sessions,
             &usage.skill_reads_codex,
-            &mut seen,
-            &mut units,
-            &mut findings,
-            now,
-        );
-    }
-    for f in pi_skill_files(&home.join(".pi/agent/npm")) {
-        push_harness_skill(
-            &f,
+            codex_files,
+        ),
+        (
             "pi",
             usage.pi_sessions,
             &usage.skill_reads_pi,
-            &mut seen,
-            &mut units,
-            &mut findings,
-            now,
-        );
-    }
-    for f in cursor_skill_files(&home.join(".cursor/skills")) {
-        push_harness_skill(
-            &f,
+            pi_skill_files(&home.join(".pi/agent/npm")),
+        ),
+        (
             "cursor",
             usage.cursor_sessions,
             &usage.skill_reads_cursor,
-            &mut seen,
-            &mut units,
-            &mut findings,
-            now,
-        );
+            cursor_skill_files(&home.join(".cursor/skills")),
+        ),
+    ] {
+        for f in files {
+            let uses = reads.get(&skill_dir_name(&f)).copied().unwrap_or(0);
+            push_skill(
+                &f,
+                harness,
+                sessions,
+                uses,
+                0,
+                &home,
+                &mut seen,
+                &mut units,
+                &mut findings,
+                &mut skills,
+                now,
+            );
+        }
     }
+    // one skill mounted twice in a harness, or two skills describing the same job
+    let dead: HashSet<String> = findings
+        .iter()
+        .filter(|f| f.rule == "dead-skill")
+        .map(|f| f.path.clone())
+        .collect();
+    findings.extend(duplicate_skills(&skills, &dead));
 
     // Claude commands: ~/.claude/commands/*.md
     if let Ok(rd) = std::fs::read_dir(home.join(".claude/commands")) {
@@ -681,15 +725,8 @@ pub(crate) fn audit() -> EstateReport {
             }
         }
     }
-    if let Ok(s) = std::fs::read_to_string(home.join(".codex/config.toml")) {
-        for line in s.lines() {
-            if let Some(rest) = line.trim().strip_prefix("[mcp_servers.") {
-                let name = rest.trim_end_matches(']').trim_matches('"').to_string();
-                if !name.contains('.') {
-                    servers.push((name, "codex", "config.toml".into()));
-                }
-            }
-        }
+    for name in codex_mcp_servers(&codex_config) {
+        servers.push((name, "codex", "config.toml".into()));
     }
     for (name, harness, scope) in &servers {
         let (own, other, other_label, sessions) = if *harness == "claude" {
@@ -1123,6 +1160,7 @@ pub(crate) fn audit() -> EstateReport {
         findings,
         blocks,
         session_stats,
+        skills,
         usage: used,
         directives,
         semantic: None,
@@ -1135,54 +1173,443 @@ pub(crate) fn audit() -> EstateReport {
     report
 }
 
+/// Record one mounted skill; flag it dead when its harness has sessions but no observed use.
 #[allow(clippy::too_many_arguments)]
-fn push_harness_skill(
+fn push_skill(
     skill_md: &Path,
-    harness: &str,
+    harness: &'static str,
     sessions: usize,
-    reads: &HashMap<String, usize>,
+    uses: usize,
+    raw_reads: usize,
+    home: &Path,
     seen: &mut HashSet<String>,
     units: &mut usize,
     findings: &mut Vec<EstateFinding>,
+    skills: &mut Vec<SkillInfo>,
     now: SystemTime,
 ) {
     // no sessions of the harness = no evidence; say nothing about it
     if sessions == 0 {
         return;
     }
-    let name = skill_md
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-    if name.is_empty() || !seen.insert(format!("{harness}:{name}")) {
+    let name = skill_dir_name(skill_md);
+    let source = skill_source(skill_md, home);
+    // several cached versions of one plugin are one unit
+    if name.is_empty() || !seen.insert(format!("{harness}|{source}|{name}")) {
         return;
     }
     let Ok(md) = skill_md.metadata() else { return };
     *units += 1;
-    if reads.get(&name).copied().unwrap_or(0) == 0 && age_days(now, md.modified().ok()) > GRACE_DAYS
-    {
-        let fix = match harness {
-            "codex" => format!(
-                "disable or uninstall the Codex plugin providing `{name}` (deleting from the plugin cache gets re-synced)"
+    let body = std::fs::read_to_string(skill_md).unwrap_or_default();
+    let tokens = crate::estimate_tokens(&body);
+    let dir = skill_md.parent().unwrap_or(skill_md).display().to_string();
+    let plugin = source.strip_prefix("plugin ");
+    if uses == 0 && age_days(now, md.modified().ok()) > GRACE_DAYS {
+        let (fix, action) = match (harness, plugin) {
+            ("claude", None) => (
+                format!(
+                    "confirm with the user, then `rm -r {dir}`; if the guidance is still wanted, move the key lines into a doc that is read on demand instead of an always-listed skill"
+                ),
+                "delete or demote",
             ),
-            "cursor" => format!(
-                "confirm with the user, then `rm -r {}`",
-                skill_md.parent().unwrap_or(skill_md).display()
+            ("claude", Some(p)) => (
+                format!(
+                    "it ships with plugin `{p}`, which installs as a unit: if the plugin's other skills are unused too, `claude plugin disable {p}`; otherwise leave it"
+                ),
+                "review plugin",
             ),
-            _ => format!("remove the pi package providing `{name}` from ~/.pi/agent/npm"),
+            ("codex", Some(p)) => (
+                format!(
+                    "disable or uninstall the Codex plugin `{p}` (deleting from the plugin cache gets re-synced)"
+                ),
+                "remove",
+            ),
+            ("pi", _) => (
+                format!("remove the pi package providing `{name}` from ~/.pi/agent/npm"),
+                "remove",
+            ),
+            _ => (
+                format!("confirm with the user, then `rm -r {dir}`"),
+                "remove",
+            ),
+        };
+        let verb = if harness == "claude" {
+            "invoked"
+        } else {
+            "read"
+        };
+        let from = plugin
+            .map(|p| format!(" (from plugin `{p}`)"))
+            .unwrap_or_default();
+        let reads_note = if raw_reads > 0 {
+            format!(" ({raw_reads} raw file reads observed, hooks or manual)")
+        } else {
+            String::new()
+        };
+        let git = if plugin.is_none() {
+            git_note(skill_md)
+        } else {
+            String::new()
         };
         findings.push(EstateFinding {
             rule: "dead-skill",
             unit: format!("skill {harness}:{name}"),
             path: skill_md.display().to_string(),
             fix,
-            tokens: crate::estimate_tokens(&std::fs::read_to_string(skill_md).unwrap_or_default()),
+            tokens,
             uses: 0,
-            detail: format!("never read across {sessions} {harness} sessions"),
-            action: "remove",
+            detail: format!(
+                "never {verb} across {sessions} {harness} sessions{from}; its description is loaded every session{reads_note}{git}"
+            ),
+            action,
         });
+    }
+    skills.push(SkillInfo {
+        harness,
+        name,
+        source,
+        path: skill_md.display().to_string(),
+        tokens,
+        uses,
+        description: frontmatter_description(&body),
+    });
+}
+
+/// `<dir>/<name>/SKILL.md` -> `<name>`.
+fn skill_dir_name(skill_md: &Path) -> String {
+    skill_md
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Top-level tables of a TOML file whose name starts with `prefix` (e.g. `plugins.`),
+/// minus those carrying `enabled = false`. Sub-tables (`[prefix.a.b]`) are ignored.
+fn toml_enabled_tables(config: &str, prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in config.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix('[').and_then(|r| r.strip_prefix(prefix)) {
+            let name = rest.trim_end_matches(']').trim_matches('"').to_string();
+            if name.contains('.') || out.contains(&name) {
+                current = None;
+            } else {
+                out.push(name.clone());
+                current = Some(name);
+            }
+        } else if t.starts_with('[') {
+            current = None;
+        } else if let Some(name) = &current
+            && t.split('#').next().unwrap_or("").replace(' ', "") == "enabled=false"
+        {
+            out.retain(|n| n != name);
+        }
+    }
+    out
+}
+
+/// Plugins ~/.codex/config.toml declares and does not disable, or None when it
+/// declares none at all (older Codex): then the whole plugin cache is the inventory.
+fn codex_enabled_plugins(config: &str) -> Option<HashSet<String>> {
+    config
+        .lines()
+        .any(|l| l.trim().starts_with("[plugins."))
+        .then(|| {
+            toml_enabled_tables(config, "plugins.")
+                .into_iter()
+                .collect()
+        })
+}
+
+/// MCP servers ~/.codex/config.toml mounts: `[mcp_servers.<name>]` tables not set `enabled = false`.
+fn codex_mcp_servers(config: &str) -> Vec<String> {
+    toml_enabled_tables(config, "mcp_servers.")
+}
+
+/// Where a harness mounts a skill from: `plugin <name>@<marketplace>` for a plugin
+/// cache entry, `pi package <pkg>` for a pi package, else its user directory relative to `~`.
+fn skill_source(skill_md: &Path, home: &Path) -> String {
+    let s = skill_md.to_string_lossy();
+    if let Some(rest) = s.split("/plugins/cache/").nth(1) {
+        let mut seg = rest.split('/');
+        if let (Some(market), Some(plugin)) = (seg.next(), seg.next()) {
+            return format!("plugin {plugin}@{market}");
+        }
+    }
+    if let Some(rest) = s.split("/node_modules/").nth(1)
+        && let Some(pkg) = rest.split("/skills/").next()
+    {
+        return format!("pi package {pkg}");
+    }
+    let dir = skill_md.parent().and_then(Path::parent).unwrap_or(skill_md);
+    match dir.strip_prefix(home) {
+        Ok(rel) => format!("~/{}", rel.display()),
+        Err(_) => dir.display().to_string(),
+    }
+}
+
+/// `<dir>/<name>/SKILL.md` for every visible subdirectory, sorted.
+fn user_skill_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path().join("SKILL.md"))
+        .filter(|f| f.is_file())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Skills of installed Claude plugins: the `installPath` of every entry in
+/// ~/.claude/plugins/installed_plugins.json, falling back to `<installPath>/<version>/`
+/// for the older cache layout. Yields (plugin name, SKILL.md).
+fn claude_plugin_skill_files(home: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(s) = std::fs::read_to_string(home.join(".claude/plugins/installed_plugins.json")) else {
+        return out;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&s) else {
+        return out;
+    };
+    let Some(plugins) = v["plugins"].as_object() else {
+        return out;
+    };
+    for (key, entries) in plugins {
+        let plugin = key.split('@').next().unwrap_or(key).to_string();
+        let entries: Vec<&Value> = match entries {
+            Value::Array(a) => a.iter().collect(),
+            other => vec![other],
+        };
+        for e in entries {
+            let Some(install) = e["installPath"].as_str() else {
+                continue;
+            };
+            let root = PathBuf::from(install);
+            let mut files = user_skill_files(&root.join("skills"));
+            if files.is_empty()
+                && let Some(version) = e["version"].as_str()
+            {
+                files = user_skill_files(&root.join(version).join("skills"));
+            }
+            out.extend(files.into_iter().map(|f| (plugin.clone(), f)));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The YAML block between the leading `---` fences, if any.
+fn frontmatter(md: &str) -> Option<&str> {
+    md.strip_prefix("---")
+        .and_then(|rest| rest.split_once("\n---"))
+        .map(|(front, _)| front)
+}
+
+/// The `description:` value of a SKILL.md: plain, quoted (possibly wrapped), or a folded block.
+fn frontmatter_description(md: &str) -> String {
+    let Some(front) = frontmatter(md) else {
+        return String::new();
+    };
+    let mut lines = front.lines();
+    let mut out = String::new();
+    while let Some(l) = lines.next() {
+        let Some(v) = l.strip_prefix("description:") else {
+            continue;
+        };
+        let v = v.trim();
+        let block = v.is_empty() || v.starts_with('>') || v.starts_with('|');
+        let open_quote = v.starts_with('"') && !(v.len() > 1 && v.ends_with('"'));
+        if !block {
+            out.push_str(v);
+        }
+        if block || open_quote {
+            for c in lines.by_ref() {
+                if block && !(c.starts_with(' ') || c.starts_with('\t')) {
+                    break;
+                }
+                out.push(' ');
+                out.push_str(c.trim());
+                if open_quote && c.trim_end().ends_with('"') {
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    out.trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim()
+        .to_string()
+}
+
+/// Lower-cased words of three or more letters, minus the connective and generic
+/// skill-description vocabulary that every description shares.
+fn content_words(s: &str) -> HashSet<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "use", "when", "this", "that", "you", "your", "are", "from",
+        "into", "not", "any", "all", "can", "will", "should", "also", "then", "than", "has",
+        "have", "its", "how", "what", "which", "who", "them", "they", "their", "about", "only",
+        "over", "more", "most", "such", "via", "per", "each", "other", "using", "used", "user",
+        "users", "asks", "ask", "want", "wants", "need", "needs", "like", "just", "one", "two",
+        "new", "get", "set", "run", "make", "work", "works", "skill", "agent", "code", "file",
+        "files", "project", "tool", "tools",
+    ];
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3 && !STOP.contains(w))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Percentage of shared wording when two descriptions are near-identical, else None.
+fn desc_overlap(a: &str, b: &str) -> Option<usize> {
+    let (wa, wb) = (content_words(a), content_words(b));
+    let shared = wa.intersection(&wb).count();
+    let union = wa.union(&wb).count();
+    if shared < DESC_SHARED_MIN || union == 0 {
+        return None;
+    }
+    let jaccard = shared as f32 / union as f32;
+    (jaccard >= DESC_OVERLAP_MIN).then(|| (jaccard * 100.0).round() as usize)
+}
+
+/// One skill mounted from several places in a harness, or two skills in a harness
+/// whose descriptions are near-identical. Copies across harnesses are deliberate
+/// (each harness reads only its own dirs) and are not duplicates. A group whose
+/// every copy already carries a dead-skill finding is left to that rule.
+fn duplicate_skills(skills: &[SkillInfo], dead: &HashSet<String>) -> Vec<EstateFinding> {
+    let mut out = Vec::new();
+    let mut by_name: HashMap<(&str, String), Vec<&SkillInfo>> = HashMap::new();
+    for s in skills {
+        by_name
+            .entry((s.harness, canon(&s.name)))
+            .or_default()
+            .push(s);
+    }
+    let mut keys: Vec<_> = by_name.keys().collect();
+    keys.sort();
+    for key in keys {
+        let copies = &by_name[key];
+        if copies.len() > 1 {
+            out.extend(duplicate_finding(copies, dead, None));
+        }
+    }
+    for (i, a) in skills.iter().enumerate() {
+        for b in &skills[i + 1..] {
+            if a.harness != b.harness || canon(&a.name) == canon(&b.name) {
+                continue;
+            }
+            if let Some(pct) = desc_overlap(&a.description, &b.description) {
+                out.extend(duplicate_finding(&[a, b], dead, Some(pct)));
+            }
+        }
+    }
+    out
+}
+
+fn duplicate_finding(
+    copies: &[&SkillInfo],
+    dead: &HashSet<String>,
+    overlap: Option<usize>,
+) -> Option<EstateFinding> {
+    if copies.iter().all(|s| dead.contains(&s.path)) {
+        return None;
+    }
+    let mut sorted = copies.to_vec();
+    // keep the used one; on a tie, the cheaper one
+    sorted.sort_by(|a, b| {
+        b.uses
+            .cmp(&a.uses)
+            .then(a.tokens.cmp(&b.tokens))
+            .then(a.path.cmp(&b.path))
+    });
+    let keep = sorted[0];
+    let rest = &sorted[1..];
+    let harness = keep.harness;
+    let listing = sorted
+        .iter()
+        .map(|s| {
+            let name = if overlap.is_some() {
+                format!("`{}` from ", s.name)
+            } else {
+                String::new()
+            };
+            format!(
+                "{name}{} (~{} tok, {}×)",
+                s.source,
+                tok_fmt(s.tokens),
+                s.uses
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shared = if harness == "claude" {
+        ""
+    } else {
+        "; reads are matched by skill name, so copies share one count"
+    };
+    let (unit, detail) = match overlap {
+        None => (
+            format!("skill {harness}:{}", keep.name),
+            format!(
+                "mounted {}× in {harness}: {listing}; every copy's description is loaded each session{shared}",
+                sorted.len()
+            ),
+        ),
+        Some(pct) => (
+            format!("skill {harness}:{} ≈ {}", sorted[0].name, sorted[1].name),
+            format!(
+                "near-identical descriptions ({pct}% shared wording): {listing}; both are loaded each session{shared}"
+            ),
+        ),
+    };
+    let removals = rest
+        .iter()
+        .map(|s| removal_hint(s))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(EstateFinding {
+        rule: "duplicate-skill",
+        unit,
+        path: rest[0].path.clone(),
+        fix: format!(
+            "keep `{}` from {} (~{} tok, {}×); {removals}",
+            keep.name,
+            keep.source,
+            tok_fmt(keep.tokens),
+            keep.uses
+        ),
+        // a dropped copy that is also dead is already priced by its dead-skill finding
+        tokens: rest
+            .iter()
+            .filter(|s| !dead.contains(&s.path))
+            .map(|s| s.tokens)
+            .sum(),
+        uses: sorted.iter().map(|s| s.uses).max().unwrap_or(0),
+        detail,
+        action: "keep one",
+    })
+}
+
+fn removal_hint(s: &SkillInfo) -> String {
+    match s.source.strip_prefix("plugin ") {
+        Some(p) => format!(
+            "disable plugin `{p}` if nothing else in it is used, else keep this copy and drop the other"
+        ),
+        None => format!(
+            "`rm -r {}`",
+            Path::new(&s.path)
+                .parent()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|| s.path.clone())
+        ),
     }
 }
 
@@ -1206,21 +1633,14 @@ fn find_skill_mds(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 /// `disable-model-invocation: true` loads only when the user types `/name`,
 /// so it costs nothing per session and is not audited.
 fn cursor_skill_files(skills: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(skills) else {
-        return Vec::new();
-    };
-    rd.flatten()
-        .map(|e| e.path().join("SKILL.md"))
-        .filter(|f| f.is_file())
+    user_skill_files(skills)
+        .into_iter()
         .filter(|f| !model_invocation_disabled(&std::fs::read_to_string(f).unwrap_or_default()))
         .collect()
 }
 
 fn model_invocation_disabled(skill_md: &str) -> bool {
-    let Some((front, _)) = skill_md
-        .strip_prefix("---")
-        .and_then(|rest| rest.split_once("\n---"))
-    else {
+    let Some(front) = frontmatter(skill_md) else {
         return false;
     };
     front.lines().any(|l| {
@@ -1433,6 +1853,22 @@ pub(crate) fn semantic_pass(report: &EstateReport) -> Result<Semantic> {
             }
         }
     }
+    if !report.skills.is_empty() {
+        digest.push_str(
+            "\n--- skill inventory (harness:name · source · size · uses: description) ---\n",
+        );
+        for s in &report.skills {
+            digest.push_str(&format!(
+                "{}:{} · {} · ~{} tok · {}×: {}\n",
+                s.harness,
+                s.name,
+                s.source,
+                tok_fmt(s.tokens),
+                s.uses,
+                crate::clip(&s.description, 200)
+            ));
+        }
+    }
     if !report.directives.is_empty() {
         digest.push_str("\n--- short user messages across sessions (count× text) ---\n");
         digest.push_str(&report.directives.join("\n"));
@@ -1442,7 +1878,8 @@ pub(crate) fn semantic_pass(report: &EstateReport) -> Result<Semantic> {
     let prompt = format!(
         "You are auditing an AI coding agent's static context (global instructions, skills, memory files, hook payloads) for waste.\n\
          Find CONTRADICTIONS (directives that conflict with each other, with themselves, or with the observed usage stats) \
-         and DUPLICATION (the same guidance stated in multiple places; also instructions the user keeps typing in sessions, \
+         and DUPLICATION (the same guidance stated in multiple places; skills within one harness whose descriptions cover \
+         the same job — name both, their sizes, and which to keep; also instructions the user keeps typing in sessions, \
          verbatim or paraphrased, that belong in CLAUDE.md — propose the exact line to add). Cite source names. Be specific.\n\n\
          CONTRADICTIONS:\n- <list>\n\nDUPLICATION:\n- <list>\n\n\
          Observed usage ({}):\n{}\n\nContext sources:\n{}",
@@ -1482,6 +1919,33 @@ fn harness_counts(s: &EstateSummary) -> String {
     }
 }
 
+/// Findings in GROUPS order, one entry per rule that has any; findings are
+/// already sorted by rule rank then cost, so each group is largest-first.
+fn grouped(r: &EstateReport) -> Vec<(&'static str, &'static str, Vec<&EstateFinding>)> {
+    let mut out = Vec::new();
+    for (rule, heading) in GROUPS {
+        let group: Vec<&EstateFinding> = r.findings.iter().filter(|f| f.rule == rule).collect();
+        if !group.is_empty() {
+            out.push((rule, heading, group));
+        }
+    }
+    let other: Vec<&EstateFinding> = r.findings.iter().filter(|f| rank(f.rule) == 99).collect();
+    if !other.is_empty() {
+        out.push(("other", "Other findings", other));
+    }
+    out
+}
+
+/// How many of a rule's findings get the full treatment: all of them unless
+/// that would leave a tail of at least two to summarize.
+fn shown_in_full(n: usize) -> usize {
+    if n > MAX_PER_RULE + 1 {
+        MAX_PER_RULE
+    } else {
+        n
+    }
+}
+
 pub(crate) fn human(r: &EstateReport) {
     let s = &r.summary;
     println!(
@@ -1504,20 +1968,41 @@ pub(crate) fn human(r: &EstateReport) {
             tok_fmt(LONG_SESSION_TOKENS)
         );
     }
+    if r.findings.iter().any(|f| f.rule.starts_with("dead-")) {
+        println!("  dead-* means zero observed uses: a unit used even once is never listed");
+    }
     if r.findings.is_empty() {
         println!("  ✔ config is clean");
     }
-    for f in &r.findings {
-        println!(
-            "  {:<20} {:>7} {:>5}  {}: {} → {}",
-            f.rule,
-            tok_or_unknown(f.tokens),
-            format!("{}×", f.uses),
-            f.unit,
-            f.detail,
-            f.action
-        );
-        println!("      fix: {}", f.fix);
+    for (rule, _, group) in grouped(r) {
+        let full = shown_in_full(group.len());
+        for f in group.iter().take(full) {
+            println!(
+                "  {:<20} {:>7} {:>5}  {}: {} → {}",
+                f.rule,
+                tok_or_unknown(f.tokens),
+                format!("{}×", f.uses),
+                f.unit,
+                f.detail,
+                f.action
+            );
+            println!("      fix: {}", f.fix);
+        }
+        let tail = &group[full..];
+        if let Some(largest) = tail.first() {
+            let cap = if largest.tokens > 0 {
+                format!(", none over ~{} tok", tok_fmt(largest.tokens))
+            } else {
+                String::new()
+            };
+            println!(
+                "  {:<20} {:>7} {:>5}  … {} more{cap}; full list with -o plan.md or --json",
+                rule,
+                tok_or_unknown(tail.iter().map(|f| f.tokens).sum()),
+                "",
+                tail.len()
+            );
+        }
     }
     if let Some(sem) = &r.semantic {
         println!("  semantic ({}):", sem.model_used);
@@ -1537,9 +2022,10 @@ pub(crate) fn human(r: &EstateReport) {
     }
 }
 
-pub(crate) const GROUPS: [(&str, &str); 14] = [
+pub(crate) const GROUPS: [(&str, &str); 15] = [
     ("dead-mcp", "Disable unused MCP servers"),
     ("dead-skill", "Delete or demote dead skills"),
+    ("duplicate-skill", "Merge duplicate skills"),
     (
         "repeated-directive",
         "Promote repeated instructions into CLAUDE.md",
@@ -1562,26 +2048,39 @@ pub(crate) const GROUPS: [(&str, &str); 14] = [
 
 pub(crate) fn markdown(r: &EstateReport) -> String {
     let s = &r.summary;
+    let groups = grouped(r);
     let mut md = format!(
         "# cxwatch audit fix report\n\n\
-         - Sessions scanned: {}\n- Units audited: {}\n- Fixes: {}\n- Tokens flagged: ~{}\n\n\
-         ## For the executing agent\n\n\
-         You are cleaning up an AI coding agent's static context. Work through the checklists below top to\n\
-         bottom; each item states its own concrete fix. Tick items off as you go. Anything involving a\n\
-         deletion or config edit: show the user exactly what you are about to change and get confirmation\n\
-         first. Do not touch anything not listed here. When finished, summarize what was applied and what\n\
-         was skipped.\n\n\
-         ## Fixes\n\n",
+         - Sessions scanned: {}\n- Units audited: {}\n- Fixes: {}\n- Tokens flagged: ~{}\n\n",
         harness_counts(s),
         s.units,
         s.findings,
         tok_fmt(s.tokens_flagged)
     );
-    for (rule, heading) in GROUPS {
-        let group: Vec<_> = r.findings.iter().filter(|f| f.rule == rule).collect();
-        if group.is_empty() {
-            continue;
+    if !groups.is_empty() {
+        md.push_str("## Summary\n\n| check | findings | tokens |\n|---|---|---|\n");
+        for (rule, _, group) in &groups {
+            let tok: usize = group.iter().map(|f| f.tokens).sum();
+            md.push_str(&format!(
+                "| `{rule}` | {} | {} |\n",
+                group.len(),
+                tok_or_unknown(tok)
+            ));
         }
+        md.push('\n');
+    }
+    md.push_str(
+        "## For the executing agent\n\n\
+         You are cleaning up an AI coding agent's static context. Work through the checklists below top to\n\
+         bottom; each item states its own concrete fix. Tick items off as you go. Anything involving a\n\
+         deletion or config edit: show the user exactly what you are about to change and get confirmation\n\
+         first. Do not touch anything not listed here. Dead items had zero observed uses across every\n\
+         scanned session; a unit used even once is never listed, so if the user says a listed item is still\n\
+         wanted for occasional work, keep it and move on. When finished, summarize what was applied and what\n\
+         was skipped.\n\n\
+         ## Fixes\n\n",
+    );
+    for (_, heading, group) in &groups {
         let saved: usize = group.iter().map(|f| f.tokens).sum();
         let saved_note = if saved > 0 {
             format!(", ~{} tok", tok_fmt(saved))
@@ -1589,16 +2088,27 @@ pub(crate) fn markdown(r: &EstateReport) -> String {
             String::new()
         };
         md.push_str(&format!("### {heading} ({}{saved_note})\n\n", group.len()));
-        for f in group {
+        let full = shown_in_full(group.len());
+        for (i, f) in group.iter().enumerate() {
             let tok_note = if f.tokens > 0 {
                 format!(" [~{} tok]", tok_fmt(f.tokens))
             } else {
                 String::new()
             };
-            md.push_str(&format!(
-                "- [ ] **{}**{tok_note}: {}\n      - why: {}\n      - file: `{}`\n",
-                f.unit, f.fix, f.detail, f.path
-            ));
+            if i == full {
+                md.push_str(&format!(
+                    "\n_{} more, in brief (same reasoning as above):_\n\n",
+                    group.len() - full
+                ));
+            }
+            if i < full {
+                md.push_str(&format!(
+                    "- [ ] **{}**{tok_note}: {}\n      - why: {}\n      - file: `{}`\n",
+                    f.unit, f.fix, f.detail, f.path
+                ));
+            } else {
+                md.push_str(&format!("- [ ] **{}**{tok_note}: {}\n", f.unit, f.fix));
+            }
         }
         md.push('\n');
     }
@@ -1680,11 +2190,16 @@ fn backticked(s: &str) -> Option<String> {
 /// Derive the mechanical fix for a finding. Manual means: hand it to a human/agent.
 pub(crate) fn fix_op(f: &EstateFinding) -> FixOp {
     match f.rule {
-        // claude and cursor skills live in their own user-owned dir; codex/pi skills are plugin/package-managed
+        // user-owned skill dirs can be trashed; plugin- and package-managed skills need their manager
         "dead-skill"
-            if ["/.claude/skills/", "/.cursor/skills/"]
-                .iter()
-                .any(|dir| f.path.contains(dir)) =>
+            if [
+                "/.claude/skills/",
+                "/.cursor/skills/",
+                "/.codex/skills/",
+                "/.agents/skills/",
+            ]
+            .iter()
+            .any(|dir| f.path.contains(dir)) =>
         {
             FixOp::Trash {
                 path: Path::new(&f.path)
@@ -2334,38 +2849,403 @@ mod tests {
         let skill = dir.join("skills/foo");
         std::fs::create_dir_all(&skill).unwrap();
         let md = skill.join("SKILL.md");
-        std::fs::write(&md, "guidance").unwrap();
+        std::fs::write(&md, "---\ndescription: guidance\n---\nbody").unwrap();
         // a future "now" makes the fresh file look past the grace period
         let now = SystemTime::now() + std::time::Duration::from_secs(100 * 86_400);
-        let reads = HashMap::new();
         let mut findings = Vec::new();
+        let mut skills = Vec::new();
         let mut units = 0;
         let mut seen = HashSet::new();
-        push_harness_skill(
+        push_skill(
             &md,
             "codex",
             0,
-            &reads,
+            0,
+            0,
+            &dir,
             &mut seen,
             &mut units,
             &mut findings,
+            &mut skills,
             now,
         );
         assert!(findings.is_empty(), "no sessions means no finding");
-        assert_eq!(units, 0);
-        push_harness_skill(
+        assert!(skills.is_empty() && units == 0);
+        push_skill(
             &md,
             "codex",
             5,
-            &reads,
+            0,
+            0,
+            &dir,
             &mut seen,
             &mut units,
             &mut findings,
+            &mut skills,
             now,
         );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, "dead-skill");
+        assert_eq!(findings[0].unit, "skill codex:foo");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description, "guidance");
+        assert_eq!(skills[0].source, "~/skills");
+        // one observed use is enough to never be dead
+        let used = dir.join("skills/bar/SKILL.md");
+        std::fs::create_dir_all(used.parent().unwrap()).unwrap();
+        std::fs::write(&used, "x").unwrap();
+        push_skill(
+            &used,
+            "codex",
+            5,
+            1,
+            0,
+            &dir,
+            &mut seen,
+            &mut units,
+            &mut findings,
+            &mut skills,
+            now,
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(skills.len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn skill_source_labels() {
+        let home = Path::new("/h");
+        assert_eq!(
+            skill_source(
+                Path::new(
+                    "/h/.codex/plugins/cache/openai-bundled/visualize/1.0.23/skills/visualize/SKILL.md"
+                ),
+                home
+            ),
+            "plugin visualize@openai-bundled"
+        );
+        assert_eq!(
+            skill_source(
+                Path::new(
+                    "/h/.claude/plugins/cache/ponytail/ponytail/4.7.0/skills/ponytail-audit/SKILL.md"
+                ),
+                home
+            ),
+            "plugin ponytail@ponytail"
+        );
+        assert_eq!(
+            skill_source(
+                Path::new("/h/.pi/agent/npm/node_modules/@scope/pkg/skills/foo/SKILL.md"),
+                home
+            ),
+            "pi package @scope/pkg"
+        );
+        assert_eq!(
+            skill_source(Path::new("/h/.agents/skills/mullet/SKILL.md"), home),
+            "~/.agents/skills"
+        );
+        assert_eq!(
+            skill_source(Path::new("/elsewhere/skills/x/SKILL.md"), home),
+            "/elsewhere/skills"
+        );
+    }
+
+    #[test]
+    fn installed_claude_plugins_yield_their_skills() {
+        let home = std::env::temp_dir().join(format!("cxwatch-plugins-{}", std::process::id()));
+        let cache = home.join(".claude/plugins/cache");
+        let flat = cache.join("mkt/flat/abc");
+        std::fs::create_dir_all(flat.join("skills/one")).unwrap();
+        std::fs::write(flat.join("skills/one/SKILL.md"), "x").unwrap();
+        let nested = cache.join("mkt/nested");
+        std::fs::create_dir_all(nested.join("1.0.0/skills/two")).unwrap();
+        std::fs::write(nested.join("1.0.0/skills/two/SKILL.md"), "y").unwrap();
+        std::fs::write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            format!(
+                r#"{{"version":2,"plugins":{{"flat@mkt":[{{"installPath":"{}","version":"abc"}}],"nested@mkt":[{{"installPath":"{}","version":"1.0.0"}}]}}}}"#,
+                flat.display(),
+                nested.display()
+            ),
+        )
+        .unwrap();
+        let got = claude_plugin_skill_files(&home);
+        assert_eq!(
+            got,
+            vec![
+                ("flat".to_string(), flat.join("skills/one/SKILL.md")),
+                (
+                    "nested".to_string(),
+                    nested.join("1.0.0/skills/two/SKILL.md")
+                ),
+            ]
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn frontmatter_description_forms() {
+        assert_eq!(
+            frontmatter_description("---\nname: a\ndescription: Plain text here\n---\nbody"),
+            "Plain text here"
+        );
+        assert_eq!(
+            frontmatter_description("---\ndescription: \"Quoted, with: colon\"\nname: a\n---\n"),
+            "Quoted, with: colon"
+        );
+        assert_eq!(
+            frontmatter_description(
+                "---\nname: a\ndescription: >-\n  Folded line one\n  and line two.\nother: x\n---\n"
+            ),
+            "Folded line one and line two."
+        );
+        assert_eq!(
+            frontmatter_description("---\ndescription: \"starts here\n  ends here\"\n---\n"),
+            "starts here ends here"
+        );
+        assert_eq!(frontmatter_description("no frontmatter"), "");
+    }
+
+    fn skill(
+        harness: &'static str,
+        name: &str,
+        source: &str,
+        tokens: usize,
+        uses: usize,
+        description: &str,
+    ) -> SkillInfo {
+        SkillInfo {
+            harness,
+            name: name.into(),
+            source: source.into(),
+            path: format!("/h/{source}/{name}/SKILL.md"),
+            tokens,
+            uses,
+            description: description.into(),
+        }
+    }
+
+    #[test]
+    fn same_skill_mounted_twice_in_one_harness_is_a_duplicate() {
+        let skills = vec![
+            skill(
+                "codex",
+                "design",
+                "plugin superpowers@obra",
+                14_000,
+                3,
+                "Design UI",
+            ),
+            skill(
+                "codex",
+                "design",
+                "~/.codex/skills",
+                8_000,
+                3,
+                "Native design",
+            ),
+            // another harness's copy is deliberate, not a duplicate
+            skill("claude", "design", "~/.claude/skills", 900, 0, "Design UI"),
+        ];
+        let f = duplicate_skills(&skills, &HashSet::new());
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "duplicate-skill");
+        assert_eq!(f[0].unit, "skill codex:design");
+        // equal use: keep the cheaper copy, price the dropped one
+        assert!(
+            f[0].fix
+                .starts_with("keep `design` from ~/.codex/skills (~8.0k tok, 3×)"),
+            "{}",
+            f[0].fix
+        );
+        assert!(f[0].fix.contains("plugin `superpowers@obra`"));
+        assert_eq!(f[0].tokens, 14_000);
+        assert_eq!(f[0].uses, 3, "copies share one name-matched count");
+        assert!(
+            f[0].detail.starts_with(
+                "mounted 2× in codex: ~/.codex/skills (~8.0k tok, 3×), plugin superpowers@obra"
+            ),
+            "{}",
+            f[0].detail
+        );
+        assert_eq!(f[0].path, "/h/plugin superpowers@obra/design/SKILL.md");
+        assert_eq!(fix_op(&f[0]), FixOp::Manual);
+    }
+
+    #[test]
+    fn used_copy_wins_and_all_dead_copies_are_left_to_dead_skill() {
+        let skills = vec![
+            skill(
+                "claude",
+                "review",
+                "~/.claude/skills",
+                2_000,
+                4,
+                "Review a PR",
+            ),
+            skill(
+                "claude",
+                "review",
+                "plugin tools@mkt",
+                500,
+                0,
+                "Review code",
+            ),
+        ];
+        let f = duplicate_skills(&skills, &HashSet::new());
+        assert_eq!(f.len(), 1);
+        assert!(
+            f[0].fix.starts_with("keep `review` from ~/.claude/skills"),
+            "{}",
+            f[0].fix
+        );
+        assert!(f[0].fix.contains("plugin `tools@mkt`"), "{}", f[0].fix);
+        // the dropped copy is dead too: its cost is already on the dead-skill finding
+        let dead: HashSet<String> = [skills[1].path.clone()].into_iter().collect();
+        let f = duplicate_skills(&skills, &dead);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].tokens, 0);
+        let dead: HashSet<String> = skills.iter().map(|s| s.path.clone()).collect();
+        assert!(duplicate_skills(&skills, &dead).is_empty());
+    }
+
+    #[test]
+    fn near_identical_descriptions_are_duplicates() {
+        let d1 = "Behavioral guidelines to reduce common LLM coding mistakes: think before coding, simplicity first, surgical changes, goal-driven execution";
+        let d2 = "Behavioral guidelines to reduce common LLM coding mistakes: think before coding, simplicity first, surgical changes, verified execution";
+        let skills = vec![
+            skill("claude", "karpathy-skills", "~/.claude/skills", 700, 2, d1),
+            skill(
+                "claude",
+                "karpathy-guidelines",
+                "plugin andrej-karpathy-skills@karpathy-skills",
+                650,
+                0,
+                d2,
+            ),
+            skill(
+                "claude",
+                "graphify",
+                "~/.claude/skills",
+                12_000,
+                9,
+                "any input to knowledge graph",
+            ),
+        ];
+        let f = duplicate_skills(&skills, &HashSet::new());
+        assert_eq!(f.len(), 1);
+        assert_eq!(
+            f[0].unit,
+            "skill claude:karpathy-skills ≈ karpathy-guidelines"
+        );
+        assert!(
+            f[0].detail.starts_with("near-identical descriptions ("),
+            "{}",
+            f[0].detail
+        );
+        // shared boilerplate alone is not overlap
+        assert!(
+            desc_overlap(
+                "Use this skill when the user asks for help",
+                "Use this skill when the user wants a tool"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn codex_config_plugins_and_mcp_servers() {
+        let cfg = "[mcp_servers.figma]\nurl = \"x\"\n\n[mcp_servers.cua_repl]\ncommand = \"y\"\nenabled = false\n\n\
+                   [mcp_servers.jira.env]\nTOKEN = \"t\"\n\n[plugins.\"notion@openai-curated\"]\nenabled = true\n\n\
+                   [plugins.\"chrome@openai-bundled\"]\nenabled = false # off\n";
+        assert_eq!(codex_mcp_servers(cfg), vec!["figma".to_string()]);
+        let enabled = codex_enabled_plugins(cfg).unwrap();
+        assert!(enabled.contains("notion@openai-curated"));
+        assert!(!enabled.contains("chrome@openai-bundled"));
+        assert!(codex_enabled_plugins("[mcp_servers.a]\nurl = \"x\"\n").is_none());
+    }
+
+    #[test]
+    fn markdown_caps_full_items_per_rule_and_summarizes() {
+        let dead = |n: usize| -> Vec<EstateFinding> {
+            (0..n)
+                .map(|i| {
+                    let mut f = finding(
+                        "dead-skill",
+                        &format!("skill codex:s{i}"),
+                        "/h/x",
+                        "remove it",
+                    );
+                    f.tokens = 100;
+                    f.detail = "never read".into();
+                    f
+                })
+                .collect()
+        };
+        let mut findings = dead(MAX_PER_RULE + 2);
+        findings.push(finding("stale-memory", "memory p", "/h/m", "review"));
+        let n = findings.len();
+        let r = EstateReport {
+            version: crate::REPORT_VERSION,
+            findings,
+            blocks: vec![],
+            session_stats: vec![],
+            skills: vec![],
+            usage: vec![],
+            directives: vec![],
+            semantic: None,
+            summary: EstateSummary {
+                sessions_claude: 1,
+                sessions_codex: 3,
+                sessions_pi: 0,
+                sessions_cursor: 0,
+                units: n,
+                findings: n,
+                tokens_flagged: 1200,
+            },
+        };
+        let md = markdown(&r);
+        assert!(md.contains("## Summary"));
+        assert!(md.contains("| `dead-skill` | 12 | ~1.2k |"), "{md}");
+        assert!(md.contains("| `stale-memory` | 1 | ? |"), "{md}");
+        assert_eq!(md.matches("- why: never read").count(), MAX_PER_RULE);
+        assert_eq!(
+            md.matches("- [ ] **skill codex:s").count(),
+            MAX_PER_RULE + 2
+        );
+        assert!(md.contains("_2 more, in brief"), "{md}");
+        assert!(md.contains("a unit used even once is never listed"));
+        // one item over the cap is shown in full rather than summarized
+        let r = EstateReport {
+            findings: dead(MAX_PER_RULE + 1),
+            ..r
+        };
+        let md = markdown(&r);
+        assert_eq!(md.matches("- why: never read").count(), MAX_PER_RULE + 1);
+        assert!(!md.contains("in brief"));
+    }
+
+    #[test]
+    fn codex_user_skills_are_trashable_but_plugin_skills_are_not() {
+        let f = finding(
+            "dead-skill",
+            "skill codex:mullet",
+            "/h/.agents/skills/mullet/SKILL.md",
+            "rm",
+        );
+        assert_eq!(
+            fix_op(&f),
+            FixOp::Trash {
+                path: "/h/.agents/skills/mullet".into()
+            }
+        );
+        let f = finding(
+            "dead-skill",
+            "skill codex:visualize",
+            "/h/.codex/plugins/cache/openai-bundled/visualize/1/skills/visualize/SKILL.md",
+            "disable",
+        );
+        assert_eq!(fix_op(&f), FixOp::Manual);
     }
 
     #[test]
